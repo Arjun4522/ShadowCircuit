@@ -1,9 +1,12 @@
 // src/directory/mod.rs
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use rand::Rng;
+use chrono::{Utc, Timelike, Datelike};
+use base64::{Engine as _, engine::general_purpose};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsensusSignature {
@@ -15,29 +18,29 @@ pub struct ConsensusSignature {
 #[derive(Debug)]
 pub enum DirectoryError {
     NoSuitableRelays,
-    RequestFailed,
-    InvalidConsensus,
+    RequestFailed(String),
+    InvalidConsensus(String),
     ParseError(String),
-    NetworkError(String),
 }
 
 impl std::fmt::Display for DirectoryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DirectoryError::NoSuitableRelays => write!(f, "No suitable relays found"),
-            DirectoryError::RequestFailed => write!(f, "Request to directory authority failed"),
-            DirectoryError::InvalidConsensus => write!(f, "Invalid consensus received"),
+            DirectoryError::RequestFailed(e) => write!(f, "Request failed: {}", e),
+            DirectoryError::InvalidConsensus(e) => write!(f, "Invalid consensus: {}", e),
             DirectoryError::ParseError(e) => write!(f, "Parse error: {}", e),
-            DirectoryError::NetworkError(e) => write!(f, "Network error: {}", e),
         }
     }
 }
+
+impl std::error::Error for DirectoryError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayDescriptor {
     pub id: String,
     pub nickname: String,
-    pub address: std::net::SocketAddr,
+    pub address: SocketAddr,
     pub identity_key: Vec<u8>,
     pub onion_key: Vec<u8>,
     pub bandwidth: u32,
@@ -55,23 +58,8 @@ pub enum RelayFlag {
     HSDir,
     V2Dir,
     Authority,
-}
-
-impl RelayFlag {
-    fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "Exit" => Some(RelayFlag::Exit),
-            "Guard" => Some(RelayFlag::Guard),
-            "Fast" => Some(RelayFlag::Fast),
-            "Stable" => Some(RelayFlag::Stable),
-            "Running" => Some(RelayFlag::Running),
-            "Valid" => Some(RelayFlag::Valid),
-            "HSDir" => Some(RelayFlag::HSDir),
-            "V2Dir" => Some(RelayFlag::V2Dir),
-            "Authority" => Some(RelayFlag::Authority),
-            _ => None,
-        }
-    }
+    BadExit,
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,19 +70,31 @@ pub struct NetworkConsensus {
     pub signatures: Vec<ConsensusSignature>,
 }
 
+const TOR_COLLECTOR_BASE: &str = "https://collector.torproject.org/recent/relay-descriptors/consensuses";
+
 #[derive(Debug)]
 pub struct DirectoryClient {
-    authorities: Vec<String>,
     consensus: RwLock<Option<NetworkConsensus>>,
     last_update: RwLock<SystemTime>,
+    use_real_consensus: bool,
 }
 
 impl DirectoryClient {
-    pub fn new(authorities: Vec<String>) -> Self {
+    pub fn new(_authorities: Vec<String>) -> Self {
+        log::info!("DirectoryClient initialized with Tor Collector API");
         Self {
-            authorities,
             consensus: RwLock::new(None),
             last_update: RwLock::new(SystemTime::UNIX_EPOCH),
+            use_real_consensus: true,
+        }
+    }
+
+    pub fn new_mock() -> Self {
+        log::info!("DirectoryClient initialized with mock data");
+        Self {
+            consensus: RwLock::new(None),
+            last_update: RwLock::new(SystemTime::UNIX_EPOCH),
+            use_real_consensus: false,
         }
     }
 
@@ -103,292 +103,329 @@ impl DirectoryClient {
         let age = SystemTime::now()
             .duration_since(last_update)
             .unwrap_or(Duration::from_secs(u64::MAX));
-        
-        // Consider fresh if less than 1 hour old
         age < Duration::from_secs(3600)
     }
 
-    async fn fetch_from_authority(&self, authority: &str) -> Result<NetworkConsensus, DirectoryError> {
-        log::info!("Fetching consensus from: {}", authority);
+    async fn fetch_latest_consensus(&self) -> Result<NetworkConsensus, DirectoryError> {
+        log::info!("Fetching latest consensus from Tor Collector");
         
-        // If it's a full URL, use it directly
-        let url = if authority.starts_with("http://") || authority.starts_with("https://") {
-            authority.to_string()
-        } else {
-            // Otherwise assume it's a directory authority IP
-            format!("http://{}/tor/status-vote/current/consensus", authority)
-        };
+        let now = Utc::now();
         
-        log::debug!("Fetching from URL: {}", url);
-        
-        // Fetch the consensus document
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| DirectoryError::NetworkError(e.to_string()))?;
-        
-        let response = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| DirectoryError::NetworkError(e.to_string()))?;
-        
-        if !response.status().is_success() {
-            return Err(DirectoryError::NetworkError(format!(
-                "HTTP error: {}",
-                response.status()
-            )));
+        // Try current hour and previous (up to 48 for ~2-day coverage)
+        for hour_offset in 0..48u32 {
+            let timestamp = now - chrono::Duration::hours(hour_offset as i64);
+            let url = format!(
+                "{}/{:04}-{:02}-{:02}-{:02}-00-00-consensus",
+                TOR_COLLECTOR_BASE,
+                timestamp.year(),
+                timestamp.month(),
+                timestamp.day(),
+                timestamp.hour()
+            );
+            
+            log::info!("Trying: {}", url);
+            
+            match self.download_and_parse(&url).await {
+                Ok(consensus) => {
+                    log::info!("✓ Successfully fetched consensus (offset: {} hours)", hour_offset);
+                    return Ok(consensus);
+                }
+                Err(e) => {
+                    log::warn!("✗ Failed offset {}: {}", hour_offset, e);
+                }
+            }
         }
         
-        let text = response
-            .text()
-            .await
-            .map_err(|e| DirectoryError::NetworkError(e.to_string()))?;
+        Err(DirectoryError::RequestFailed("Could not fetch from any recent hour".to_string()))
+    }
+
+    async fn download_and_parse(&self, url: &str) -> Result<NetworkConsensus, DirectoryError> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))  // Increased for large file
+            .build()
+            .map_err(|e| DirectoryError::RequestFailed(e.to_string()))?;
         
-        log::info!("Downloaded consensus document, {} bytes", text.len());
+        let response = client.get(url).send().await
+            .map_err(|e| DirectoryError::RequestFailed(format!("HTTP: {}", e)))?;
         
-        // Parse the consensus
+        if !response.status().is_success() {
+            return Err(DirectoryError::RequestFailed(format!("Status: {}", response.status())));
+        }
+        
+        let text = response.text().await
+            .map_err(|e| DirectoryError::RequestFailed(format!("Read: {}", e)))?;
+        
+        log::info!("Downloaded {} bytes", text.len());
+
+        // Debug: Count raw r lines
+        let r_count = text.lines().filter(|l| l.trim().starts_with("r ")).count();
+        log::info!("Raw r line count in download: {}", r_count);
+        
         self.parse_consensus(&text).await
     }
 
-    async fn parse_consensus(&self, text: &str) -> Result<NetworkConsensus, DirectoryError> {
-        log::info!("Parsing consensus document");
-        
+    async fn create_mock_consensus(&self) -> Result<NetworkConsensus, DirectoryError> {
+        log::info!("Creating mock consensus");
         let mut relays = HashMap::new();
-        let mut valid_after = SystemTime::UNIX_EPOCH;
-        let mut valid_until = SystemTime::UNIX_EPOCH;
         
-        let mut current_relay: Option<RelayDescriptor> = None;
-        let mut in_router_section = false;
-        
-        for line in text.lines() {
-            let line = line.trim();
-            
-            // Parse header fields
-            if line.starts_with("valid-after ") {
-                // Format: valid-after 2024-01-15 12:00:00
-                // For simplicity, we'll just mark it as now
-                valid_after = SystemTime::now();
-            } else if line.starts_with("valid-until ") {
-                valid_until = SystemTime::now() + Duration::from_secs(3600);
-            }
-            // Parse router status entries (r lines)
-            else if line.starts_with("r ") {
-                // Save previous relay if exists
-                if let Some(relay) = current_relay.take() {
-                    relays.insert(relay.id.clone(), relay);
-                }
-                in_router_section = true;
-                
-                // Parse: r nickname identity published IP ORPort DirPort
-                // Example: r moria1 npFBIw4qLbDVe+891Z/0kZZpRq4 2024-01-15 12:00:00 128.31.0.34 9101 9131
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 7 {
-                    let nickname = parts[1].to_string();
-                    let identity = parts[2].to_string(); // Base64 encoded
-                    let ip = parts[5];
-                    let or_port: u16 = parts[6].parse().unwrap_or(9001);
-                    
-                    // Try to parse the address
-                    if let Ok(addr) = format!("{}:{}", ip, or_port).parse() {
-                        current_relay = Some(RelayDescriptor {
-                            id: identity.clone(),
-                            nickname,
-                            address: addr,
-                            identity_key: identity.as_bytes().to_vec(), // Store raw for now
-                            onion_key: vec![0; 32], // Will be filled from 's' line if present
-                            bandwidth: 1000000, // Default, will be updated
-                            flags: vec![],
-                        });
-                    }
-                }
-            }
-            // Parse flags (s lines)
-            else if line.starts_with("s ") && in_router_section {
-                if let Some(ref mut relay) = current_relay {
-                    // Parse: s Exit Fast Guard Running Stable Valid
-                    let flags: Vec<RelayFlag> = line[2..]
-                        .split_whitespace()
-                        .filter_map(RelayFlag::from_str)
-                        .collect();
-                    relay.flags = flags;
-                }
-            }
-            // Parse bandwidth (w lines)
-            else if line.starts_with("w ") && in_router_section {
-                if let Some(ref mut relay) = current_relay {
-                    // Parse: w Bandwidth=1000
-                    for part in line[2..].split_whitespace() {
-                        if let Some(bw_str) = part.strip_prefix("Bandwidth=") {
-                            if let Ok(bw) = bw_str.parse::<u32>() {
-                                relay.bandwidth = bw;
-                            }
-                        }
-                    }
-                }
-            }
+        // Mock 10 relays with varied flags
+        let mock_relays = vec![
+            ("Guard1", "192.168.1.1:9001", vec![RelayFlag::Guard, RelayFlag::Fast, RelayFlag::Running, RelayFlag::Valid], 1000000),
+            ("Middle1", "192.168.1.2:9001", vec![RelayFlag::Fast, RelayFlag::Stable, RelayFlag::Running, RelayFlag::Valid], 2000000),
+            ("Exit1", "192.168.1.3:9001", vec![RelayFlag::Exit, RelayFlag::Fast, RelayFlag::Running, RelayFlag::Valid], 3000000),
+            // ... add 7 more similar
+            ("Guard2", "192.168.1.4:9001", vec![RelayFlag::Guard, RelayFlag::Fast, RelayFlag::Running, RelayFlag::Valid], 1500000),
+            ("Middle2", "192.168.1.5:9001", vec![RelayFlag::Fast, RelayFlag::Stable, RelayFlag::Running, RelayFlag::Valid], 2500000),
+            ("Exit2", "192.168.1.6:9001", vec![RelayFlag::Exit, RelayFlag::Fast, RelayFlag::Running, RelayFlag::Valid], 3500000),
+            ("Guard3", "192.168.1.7:9001", vec![RelayFlag::Guard, RelayFlag::Fast, RelayFlag::Running, RelayFlag::Valid], 1200000),
+            ("Middle3", "192.168.1.8:9001", vec![RelayFlag::Fast, RelayFlag::Stable, RelayFlag::Running, RelayFlag::Valid], 2200000),
+            ("Exit3", "192.168.1.9:9001", vec![RelayFlag::Exit, RelayFlag::Fast, RelayFlag::Running, RelayFlag::Valid], 3200000),
+            ("Fallback", "192.168.1.10:9001", vec![RelayFlag::Fast, RelayFlag::Running, RelayFlag::Valid], 1000000),
+        ];
+
+        for (nick, addr_str, flags, bw) in mock_relays {
+            let addr: SocketAddr = addr_str.parse().unwrap();
+            let id = format!("mock-{}", nick);
+            relays.insert(id.clone(), RelayDescriptor {
+                id,
+                nickname: nick.to_string(),
+                address: addr,
+                identity_key: vec![0u8; 20],  // Dummy
+                onion_key: vec![0u8; 32],  // Dummy
+                bandwidth: bw,
+                flags,
+            });
         }
-        
-        // Save last relay
-        if let Some(relay) = current_relay {
-            relays.insert(relay.id.clone(), relay);
-        }
-        
-        log::info!("Parsed {} relays from consensus", relays.len());
-        
-        if relays.is_empty() {
-            return Err(DirectoryError::ParseError("No relays found in consensus".to_string()));
-        }
-        
+
+        log::info!("Created mock consensus with {} relays", relays.len());
+
         Ok(NetworkConsensus {
-            valid_after,
-            valid_until,
+            valid_after: SystemTime::now(),
+            valid_until: SystemTime::now() + Duration::from_secs(3600),
             relays,
             signatures: vec![],
         })
     }
 
-    async fn validate_consensus(&self, candidates: Vec<NetworkConsensus>) -> Result<NetworkConsensus, DirectoryError> {
-        // For now, just use the first valid consensus
-        // In real Tor, this would verify signatures from multiple authorities
-        for consensus in candidates {
-            if !consensus.relays.is_empty() {
-                return Ok(consensus);
+    async fn parse_consensus(&self, text: &str) -> Result<NetworkConsensus, DirectoryError> {
+        let mut relays = HashMap::new();
+        let lines: Vec<&str> = text.lines().collect();
+        let mut i = 0usize;
+
+        while i < lines.len() {
+            let line = lines[i].trim();
+            if line.starts_with("r ") {
+                match self.parse_relay(&lines, &mut i) {
+                    Ok(relay) => {
+                        relays.insert(relay.id.clone(), relay);
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to parse relay at line {}: {}", i, e);
+                    }
+                }
+                // Skip to next potential r (handles s/w/p/v lines in block)
+                i += 1;
+                while i < lines.len() && !lines[i].trim().starts_with("r ") {
+                    i += 1;
+                }
+                continue;
             }
+            i += 1;
         }
-        Err(DirectoryError::InvalidConsensus)
+
+        log::info!("Parsed {} relays", relays.len());
+
+        if relays.is_empty() {
+            return Err(DirectoryError::InvalidConsensus("No relays found".to_string()));
+        }
+
+        Ok(NetworkConsensus {
+            valid_after: SystemTime::now(),
+            valid_until: SystemTime::now() + Duration::from_secs(3600),
+            relays,
+            signatures: vec![],
+        })
     }
 
-    fn is_relay_suitable(&self, relay: &RelayDescriptor, hop_number: usize) -> bool {
-        // Relay must be Running and Valid
+    fn parse_relay(&self, lines: &[&str], i: &mut usize) -> Result<RelayDescriptor, DirectoryError> {
+        let parts: Vec<&str> = lines[*i].trim().split_whitespace().collect();
+        if parts.len() != 9 || parts[0] != "r" {
+            return Err(DirectoryError::ParseError(format!(
+                "Invalid r line (expected 9 parts due to space in timestamp, got {}): {}",
+                parts.len(), lines[*i]
+            )));
+        }
+
+        let nickname = parts[1].to_string();
+        let identity_full = parts[2];  // Unpadded base64, e.g., "/bi8Q7vSJkjbGdiXSx30Cae/DtI"
+        let _digest = parts[3];  // Base64 digest, unused
+        let _published_date = parts[4];  // "YYYY-MM-DD", unused
+        let _published_time = parts[5];  // "HH:MM:SS", unused
+        let ip = parts[6];  // IPv4
+        let or_port: u16 = parts[7].parse()
+            .map_err(|_| DirectoryError::ParseError("Invalid OR port".to_string()))?;
+        let _dir_port: u16 = parts[8].parse()
+            .map_err(|_| DirectoryError::ParseError("Invalid Dir port".to_string()))?;
+
+        let address = format!("{}:{}", ip, or_port).parse()
+            .map_err(|e| DirectoryError::ParseError(format!("Invalid address: {}", e)))?;
+
+        // Decode identity: Unpadded base64 → replace chars, add padding, decode to 20 bytes
+        let mut identity_padded = identity_full.replace('-', "+").replace('_', "/");
+        while identity_padded.len() % 4 != 0 {
+            identity_padded.push('=');
+        }
+        let identity_key = general_purpose::STANDARD
+            .decode(&identity_padded)
+            .map_err(|e| DirectoryError::ParseError(format!("Invalid identity base64: {}", e)))?;
+        if identity_key.len() != 20 {
+            return Err(DirectoryError::ParseError(format!(
+                "Identity key wrong length: {} bytes (expected 20)", identity_key.len()
+            )));
+        }
+
+        let onion_key = identity_key.clone();  // Placeholder; fetch NTor key from microdesc later
+
+        // Parse flags: Next line usually "s "
+        let mut flags = vec![RelayFlag::Running, RelayFlag::Valid];
+        let mut j = *i + 1;
+        if j < lines.len() {
+            let next_line = lines[j].trim();
+            if next_line.starts_with("s ") {
+                flags = self.parse_flags(next_line);
+                j += 1;
+            }
+        }
+
+        // Parse bandwidth: First "w Bandwidth=..." in next 5 lines
+        let mut bandwidth = 1000000u32;
+        for offset in 0..5 {
+            let check_j = j + offset;
+            if check_j < lines.len() {
+                let w_line = lines[check_j].trim();
+                if let Some(bw) = self.parse_bandwidth(w_line) {
+                    bandwidth = bw;
+                    break;
+                }
+            }
+        }
+
+        *i = j - 1;  // For outer loop advance
+
+        Ok(RelayDescriptor {
+            id: identity_full.to_string(),
+            nickname,
+            address,
+            identity_key,
+            onion_key,
+            bandwidth,
+            flags,
+        })
+    }
+    fn parse_flags(&self, line: &str) -> Vec<RelayFlag> {
+        line.split_whitespace().skip(1).map(|flag| match flag {
+            "Exit" => RelayFlag::Exit,
+            "Guard" => RelayFlag::Guard,
+            "Fast" => RelayFlag::Fast,
+            "Stable" => RelayFlag::Stable,
+            "Running" => RelayFlag::Running,
+            "Valid" => RelayFlag::Valid,
+            "HSDir" => RelayFlag::HSDir,
+            "V2Dir" => RelayFlag::V2Dir,
+            "Authority" => RelayFlag::Authority,
+            "BadExit" => RelayFlag::BadExit,
+            "MiddleOnly" | "StaleDesc" | "Sybil" | "NoEdConsensus" => RelayFlag::Unknown(flag.to_string()),
+            other => RelayFlag::Unknown(other.to_string()),
+        }).collect()
+    }
+
+    fn parse_bandwidth(&self, line: &str) -> Option<u32> {
+        line.split_whitespace().skip(1).find_map(|part| {
+            part.strip_prefix("Bandwidth=").and_then(|bw_str| bw_str.parse().ok())
+        })
+    }
+
+    fn is_relay_suitable(&self, relay: &RelayDescriptor, hop: usize) -> bool {
         if !relay.flags.contains(&RelayFlag::Running) || !relay.flags.contains(&RelayFlag::Valid) {
             return false;
         }
-        
-        // Position-specific requirements
-        match hop_number {
-            0 => {
-                // Entry/Guard node - should have Guard flag
-                relay.flags.contains(&RelayFlag::Guard) && relay.flags.contains(&RelayFlag::Fast)
-            }
-            1 => {
-                // Middle node - should be Fast
-                relay.flags.contains(&RelayFlag::Fast)
-            }
-            2 => {
-                // Exit node - should have Exit flag
-                relay.flags.contains(&RelayFlag::Exit) && relay.flags.contains(&RelayFlag::Fast)
-            }
+        if relay.flags.contains(&RelayFlag::BadExit) {
+            return false;
+        }
+        match hop {
+            0 => relay.flags.contains(&RelayFlag::Guard) && relay.flags.contains(&RelayFlag::Fast),
+            1 => relay.flags.contains(&RelayFlag::Fast) && relay.flags.contains(&RelayFlag::Stable),
+            2 => relay.flags.contains(&RelayFlag::Exit) && relay.flags.contains(&RelayFlag::Fast),
             _ => relay.flags.contains(&RelayFlag::Fast),
         }
     }
 
-    fn select_weighted_relay(&self, relays: Vec<&RelayDescriptor>) -> Result<RelayDescriptor, DirectoryError> {
+    fn select_weighted(&self, relays: Vec<&RelayDescriptor>) -> Result<RelayDescriptor, DirectoryError> {
         if relays.is_empty() {
             return Err(DirectoryError::NoSuitableRelays);
         }
         
-        // Simple weighted selection based on bandwidth
-        let total_bandwidth: u64 = relays.iter().map(|r| r.bandwidth as u64).sum();
-        
-        if total_bandwidth == 0 {
-            // Fallback to random selection
+        let total: u64 = relays.iter().map(|r| r.bandwidth as u64).sum();
+        if total == 0 {
             let mut rng = rand::thread_rng();
-            let idx = rng.gen_range(0..relays.len());
-            return Ok(relays[idx].clone());
+            return Ok(relays[rng.gen_range(0..relays.len())].clone());
         }
         
         let mut rng = rand::thread_rng();
-        let mut selection = rng.gen_range(0..total_bandwidth);
+        let mut sel = rng.gen_range(0..total);
         
         for relay in &relays {
-            if selection < relay.bandwidth as u64 {
+            if sel < relay.bandwidth as u64 {
                 return Ok((*relay).clone());
             }
-            selection -= relay.bandwidth as u64;
+            sel -= relay.bandwidth as u64;
         }
         
-        // Fallback to first relay
         Ok(relays[0].clone())
     }
     
-    /// Fetch and validate network consensus
     pub async fn fetch_consensus(&self) -> Result<NetworkConsensus, DirectoryError> {
-        // Check if we have a recent consensus
         if self.is_consensus_fresh().await {
-            if let Some(consensus) = self.consensus.read().await.as_ref() {
+            if let Some(c) = self.consensus.read().await.as_ref() {
                 log::debug!("Using cached consensus");
-                return Ok(consensus.clone());
+                return Ok(c.clone());
             }
         }
         
-        log::info!("Consensus is stale or missing, fetching new one");
+        let consensus = if self.use_real_consensus {
+            self.fetch_latest_consensus().await?
+        } else {
+            self.create_mock_consensus().await?
+        };
         
-        // Fetch from directory authorities
-        let mut consensus_candidates = Vec::new();
-        
-        for authority in &self.authorities {
-            match self.fetch_from_authority(authority).await {
-                Ok(consensus) => {
-                    log::info!("Successfully fetched consensus from {}", authority);
-                    consensus_candidates.push(consensus);
-                    break; // Use first successful fetch
-                }
-                Err(e) => {
-                    log::warn!("Failed to fetch from {}: {}", authority, e);
-                }
-            }
-        }
-        
-        if consensus_candidates.is_empty() {
-            return Err(DirectoryError::RequestFailed);
-        }
-        
-        // Validate and select consensus
-        let consensus = self.validate_consensus(consensus_candidates).await?;
-        
-        log::info!("Using consensus with {} relays", consensus.relays.len());
-        
-        // Update cache
         *self.consensus.write().await = Some(consensus.clone());
         *self.last_update.write().await = SystemTime::now();
         
         Ok(consensus)
     }
     
-    /// Select appropriate relay for a specific hop position
-    pub async fn select_relay(&self, hop_number: usize) -> Result<RelayDescriptor, DirectoryError> {
+    pub async fn select_relay(&self, hop: usize) -> Result<RelayDescriptor, DirectoryError> {
         let consensus = self.fetch_consensus().await?;
         
-        log::debug!("Selecting relay for hop {} from {} total relays", 
-                   hop_number, consensus.relays.len());
-        
-        let suitable_relays: Vec<&RelayDescriptor> = consensus.relays
-            .values()
-            .filter(|relay| self.is_relay_suitable(relay, hop_number))
+        let suitable: Vec<&RelayDescriptor> = consensus.relays.values()
+            .filter(|r| self.is_relay_suitable(r, hop))
             .collect();
         
-        log::info!("Found {} suitable relays for hop {}", suitable_relays.len(), hop_number);
+        log::debug!("Found {} suitable relays for hop {}", suitable.len(), hop);
         
-        if suitable_relays.is_empty() {
-            // Fallback: relax requirements and just use Running relays
-            log::warn!("No suitable relays with strict requirements, relaxing constraints");
-            let fallback_relays: Vec<&RelayDescriptor> = consensus.relays
-                .values()
-                .filter(|relay| {
-                    relay.flags.contains(&RelayFlag::Running) && 
-                    relay.flags.contains(&RelayFlag::Valid)
-                })
+        if suitable.is_empty() {
+            let fallback: Vec<&RelayDescriptor> = consensus.relays.values()
+                .filter(|r| r.flags.contains(&RelayFlag::Running) && !r.flags.contains(&RelayFlag::BadExit))
                 .collect();
             
-            if fallback_relays.is_empty() {
+            if fallback.is_empty() {
                 return Err(DirectoryError::NoSuitableRelays);
             }
             
-            return self.select_weighted_relay(fallback_relays);
+            log::warn!("Using fallback for hop {}", hop);
+            return self.select_weighted(fallback);
         }
         
-        // Weighted random selection based on bandwidth
-        self.select_weighted_relay(suitable_relays)
+        self.select_weighted(suitable)
     }
 }
