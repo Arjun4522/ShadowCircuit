@@ -15,5 +15,11 @@ COPY . .
 # Build the project
 RUN cargo build
 
+# Expose the SOCKS5 port
+EXPOSE 9050
+
+# Set environment variable for logging
+ENV RUST_LOG=info
+
 # Run the project
 CMD ["cargo", "run"]

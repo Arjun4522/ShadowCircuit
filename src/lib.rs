@@ -1,4 +1,3 @@
-
 // src/lib.rs
 
 use std::sync::Arc;
@@ -54,8 +53,10 @@ impl TorClient {
     pub async fn start(config: TorConfig) -> Result<Self, TorError> {
         let circuit_manager = Arc::new(CircuitManager::new());
         let directory_client = Arc::new(DirectoryClient::new(config.directory_authorities));
+        
+        // Bind to 0.0.0.0 to accept connections from outside the container
         let socks5_proxy = Socks5Proxy::new(
-            format!("127.0.0.1:{}", config.socks_port),
+            format!("0.0.0.0:{}", config.socks_port),
             circuit_manager.clone(),
             directory_client.clone(),
         );
@@ -67,12 +68,12 @@ impl TorClient {
         })
     }
 
-    pub async fn create_circuit(&self, num_hops: usize) -> Result<CircuitId, TorError> {
+    pub async fn create_circuit(&self, _num_hops: usize) -> Result<CircuitId, TorError> {
         // self.circuit_manager.create_circuit(num_hops, &self.directory_client).await.map_err(|e| TorError::Circuit(e))
         todo!()
     }
 
-    pub async fn http_get(&self, url: &str) -> Result<String, TorError> {
+    pub async fn http_get(&self, _url: &str) -> Result<String, TorError> {
         todo!()
     }
 
