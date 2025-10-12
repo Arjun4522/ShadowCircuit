@@ -1,0 +1,928 @@
+Directory structure:
+└── arjun4522-shadowcircuit/
+    ├── README.md
+    ├── Cargo.toml
+    ├── config.yaml
+    ├── src/
+    │   ├── lib.rs
+    │   ├── main.rs
+    │   ├── metrics.rs
+    │   ├── security.rs
+    │   ├── circuit/
+    │   │   └── mod.rs
+    │   ├── crypto/
+    │   │   └── mod.rs
+    │   ├── directory/
+    │   │   └── mod.rs
+    │   └── proxy/
+    │       ├── http.rs
+    │       ├── mod.rs
+    │       └── socks5.rs
+    └── tests/
+        ├── integration/
+        │   └── full_circuit.rs
+        └── unit/
+            └── crypto_tests.rs
+
+================================================
+FILE: README.md
+================================================
+
+# Rust Tor-like Anonymity Network Client
+
+A Rust implementation of a Tor-like anonymity network client that provides secure, anonymous communication through multi-hop circuits and onion routing.
+
+**Disclaimer:** This project is a toy project for educational purposes only. It is not a secure or anonymous way to access the internet. Do not use it for any real-world anonymous communication.
+
+## Features
+
+*   Multi-hop circuit routing (in progress)
+*   Onion encryption (in progress)
+*   SOCKS5 proxy interface (partially functional)
+*   Pluggable transports (not implemented)
+*   Directory system integration (partially functional)
+*   Hidden services support (not implemented)
+
+## Getting Started
+
+### Prerequisites
+
+*   [Rust](https://www.rust-lang.org/tools/install)
+
+### Building
+
+```bash
+cargo build
+```
+
+### Running
+
+```bash
+cargo run
+```
+
+This will start a SOCKS5 proxy on `localhost:9051`.
+
+### Testing
+
+```bash
+cargo test
+```
+
+
+
+================================================
+FILE: Cargo.toml
+================================================
+
+[package]
+name = "tor-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+ring = "0.17"
+x25519-dalek = "2.0"
+aes-gcm = "0.10"
+ed25519-dalek = "2.0"
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sled = "0.34"
+dirs = "5.0"
+thiserror = "1.0"
+log = "0.4"
+env_logger = "0.10"
+zeroize = "1.5"
+
+[dev-dependencies]
+mockall = "0.11"
+proptest = "1.0"
+criterion = "0.5"
+tokio-test = "0.4"
+
+[[test]]
+name = "integration"
+path = "tests/integration/full_circuit.rs"
+harness = true
+
+[package.metadata.fuzz]
+targets = ["cell_parsing", "crypto_operations"]
+
+
+
+================================================
+FILE: config.yaml
+================================================
+
+# config.yaml
+data_directory: /var/lib/tor-client
+socks_port: 9050
+control_port: 9051
+directory_authorities:
+  - "authority1.torproject.org:80"
+  - "authority2.torproject.org:80"
+entry_guards:
+  - "guard1.example.com:443"
+  - "guard2.example.com:443"
+log_level: "info"
+
+
+
+================================================
+FILE: src/lib.rs
+================================================
+
+// src/lib.rs
+
+use std::sync::Arc;
+
+pub use circuit::{CircuitId, CircuitManager};
+pub use directory::DirectoryClient;
+// pub use proxy::ProxyServer;
+
+#[derive(Debug, Clone)]
+pub struct TorConfig {
+    pub data_directory: String,
+    pub socks_port: u16,
+    pub control_port: u16,
+    pub directory_authorities: Vec<String>,
+    pub entry_guards: Vec<String>,
+    // pub exit_policy: ExitPolicy,
+}
+
+impl Default for TorConfig {
+    fn default() -> Self {
+        Self {
+            data_directory: "".to_string(),
+            socks_port: 9050,
+            control_port: 9051,
+            directory_authorities: vec![],
+            entry_guards: vec![],
+        }
+    }
+}
+
+impl TorConfig {
+    pub fn test_config() -> Self {
+        Self {
+            data_directory: "".to_string(),
+            socks_port: 9050,
+            control_port: 9051,
+            directory_authorities: vec![],
+            entry_guards: vec![],
+        }
+    }
+}
+
+
+use crate::proxy::socks5::Socks5Proxy;
+
+pub struct TorClient {
+    circuit_manager: Arc<CircuitManager>,
+    directory_client: Arc<DirectoryClient>,
+    pub socks5_proxy: Socks5Proxy,
+}
+
+impl TorClient {
+    pub async fn start(config: TorConfig) -> Result<Self, TorError> {
+        let circuit_manager = Arc::new(CircuitManager::new());
+        let directory_client = Arc::new(DirectoryClient::new(config.directory_authorities));
+        let socks5_proxy = Socks5Proxy::new(
+            format!("127.0.0.1:{}", config.socks_port),
+            circuit_manager.clone(),
+            directory_client.clone(),
+        );
+
+        Ok(Self {
+            circuit_manager,
+            directory_client,
+            socks5_proxy,
+        })
+    }
+
+    pub async fn create_circuit(&self, num_hops: usize) -> Result<CircuitId, TorError> {
+        // self.circuit_manager.create_circuit(num_hops, &self.directory_client).await.map_err(|e| TorError::Circuit(e))
+        todo!()
+    }
+
+    pub async fn http_get(&self, url: &str) -> Result<String, TorError> {
+        todo!()
+    }
+
+    pub async fn shutdown(self) {
+        todo!()
+    }
+}
+
+#[derive(Debug)]
+pub enum TorError {
+    // Circuit(CircuitError),
+    // Directory(DirectoryError),
+    // Proxy(ProxyError),
+}
+
+impl std::fmt::Display for TorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TorError")
+    }
+}
+
+impl std::error::Error for TorError {}
+
+pub mod circuit;
+pub mod crypto;
+pub mod directory;
+pub mod proxy;
+pub mod security;
+pub mod metrics;
+
+
+
+================================================
+FILE: src/main.rs
+================================================
+
+// src/main.rs
+use tor_client::{TorClient, TorConfig};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+    
+    // Configure Tor client
+    let config = TorConfig {
+        data_directory: dirs::home_dir()
+            .unwrap()
+            .join(".tor-client")
+            .to_string_lossy()
+            .to_string(),
+        socks_port: 9050,
+        control_port: 9051,
+        directory_authorities: vec![
+            "authority1.example.com:80".to_string(),
+            "authority2.example.com:80".to_string(),
+        ],
+        ..Default::default()
+    };
+    
+    // Start Tor client
+    let tor_client = TorClient::start(config).await?;
+    
+    // Start SOCKS5 proxy
+    tokio::spawn(async move {
+        if let Err(e) = tor_client.socks5_proxy.run().await {
+            log::error!("SOCKS5 proxy error: {:?}", e);
+        }
+    });
+
+    // Wait for shutdown signal
+    tokio::signal::ctrl_c().await?;
+    // tor_client.shutdown().await;
+    
+    Ok(())
+}
+
+
+
+================================================
+FILE: src/metrics.rs
+================================================
+
+// src/metrics.rs
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub struct Metrics {
+    pub circuits_created: AtomicU64,
+    pub bytes_sent: AtomicU64,
+    pub bytes_received: AtomicU64,
+    pub active_circuits: AtomicU64,
+}
+
+impl Metrics {
+    pub fn new() -> Self {
+        Self {
+            circuits_created: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+            active_circuits: AtomicU64::new(0),
+        }
+    }
+    
+    pub fn report(&self) -> String {
+        format!(
+            "circuits_created: {}, bytes_sent: {}, bytes_received: {}, active_circuits: {}",
+            self.circuits_created.load(Ordering::Relaxed),
+            self.bytes_sent.load(Ordering::Relaxed),
+            self.bytes_received.load(Ordering::Relaxed),
+            self.active_circuits.load(Ordering::Relaxed),
+        )
+    }
+}
+
+
+
+================================================
+FILE: src/security.rs
+================================================
+
+// src/security.rs
+
+// Always use constant-time comparisons
+fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    
+    let mut result = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        result |= x ^ y;
+    }
+    
+    result == 0
+}
+
+// Secure memory zeroization
+use zeroize::Zeroize;
+
+struct SecretData {
+    key: [u8; 32],
+}
+
+impl Zeroize for SecretData {
+    fn zeroize(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+impl Drop for SecretData {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+
+
+================================================
+FILE: src/circuit/mod.rs
+================================================
+
+// src/circuit/mod.rs
+use crate::crypto::OnionCrypto;
+use crate::directory::DirectoryClient;
+use std::collections::HashMap;
+use tokio::sync::RwLock;
+
+#[derive(Debug)]
+pub enum CircuitError {
+    Crypto(String),
+    Directory(crate::directory::DirectoryError),
+    Io(String),
+    NoSuitableRelays,
+}
+
+impl From<crate::crypto::CryptoError> for CircuitError {
+    fn from(err: crate::crypto::CryptoError) -> Self {
+        CircuitError::Crypto(format!("{:?}", err))
+    }
+}
+
+impl From<crate::directory::DirectoryError> for CircuitError {
+    fn from(err: crate::directory::DirectoryError) -> Self {
+        CircuitError::Directory(err)
+    }
+}
+
+pub type CircuitId = u32;
+
+#[derive(Debug, Clone)]
+pub struct RelayHop {
+    pub relay_id: String,
+    pub ip: std::net::SocketAddr,
+    pub identity_key: Vec<u8>,
+    pub onion_key: Vec<u8>,
+    pub crypto_state: OnionCrypto,
+}
+
+#[derive(Debug)]
+pub struct Circuit {
+    pub id: CircuitId,
+    pub hops: Vec<RelayHop>,
+    pub state: CircuitState,
+    pub created_at: std::time::Instant,
+}
+
+#[derive(Debug)]
+pub enum CircuitState {
+    Building,
+    Ready,
+    Closed,
+    Error(String),
+}
+
+#[derive(Debug)]
+pub struct CircuitManager {
+    circuits: RwLock<HashMap<CircuitId, Circuit>>,
+    next_circuit_id: RwLock<CircuitId>,
+}
+
+impl CircuitManager {
+    pub fn new() -> Self {
+        Self {
+            circuits: RwLock::new(HashMap::new()),
+            next_circuit_id: RwLock::new(1),
+        }
+    }
+    
+    /// Create a new circuit with specified number of hops
+    pub async fn create_circuit(
+        &self,
+        num_hops: usize,
+        directory: &DirectoryClient
+    ) -> Result<CircuitId, CircuitError> {
+        let circuit_id = {
+            let mut next_id = self.next_circuit_id.write().await;
+            let id = *next_id;
+            *next_id += 1;
+            id
+        };
+        
+        let mut hops = Vec::with_capacity(num_hops);
+        
+        // Select relays for each hop
+        for hop_num in 0..num_hops {
+            let relay = directory.select_relay(hop_num).await?;
+            let crypto = OnionCrypto::new()?;
+            
+            hops.push(RelayHop {
+                relay_id: relay.id,
+                ip: relay.address,
+                identity_key: relay.identity_key,
+                onion_key: relay.onion_key,
+                crypto_state: crypto,
+            });
+        }
+        
+        let circuit = Circuit {
+            id: circuit_id,
+            hops,
+            state: CircuitState::Building,
+            created_at: std::time::Instant::now(),
+        };
+        
+        // Store circuit
+        self.circuits.write().await.insert(circuit_id, circuit);
+        
+        // Perform circuit handshake with each hop
+        self.perform_handshakes(circuit_id).await?;
+        
+        // Mark circuit as ready
+        if let Some(circuit) = self.circuits.write().await.get_mut(&circuit_id) {
+            circuit.state = CircuitState::Ready;
+        }
+        
+        Ok(circuit_id)
+    }
+    
+    async fn perform_handshakes(&self, circuit_id: CircuitId) -> Result<(), CircuitError> {
+        // Implementation of CREATE, EXTEND, and crypto handshakes
+        // with each relay in the circuit
+        todo!("Implement circuit handshake protocol")
+    }
+}
+
+
+
+================================================
+FILE: src/crypto/mod.rs
+================================================
+// src/crypto/mod.rs
+use ring::{aead, rand};
+use ring::aead::UnboundKey;
+use ring::rand::SecureRandom;
+
+#[derive(Debug)]
+pub enum CryptoError {
+    RingError(ring::error::Unspecified),
+}
+
+impl From<ring::error::Unspecified> for CryptoError {
+    fn from(err: ring::error::Unspecified) -> Self {
+        CryptoError::RingError(err)
+    }
+}
+
+fn generate_aead_key(rng: &ring::rand::SystemRandom) -> Result<[u8; 32], CryptoError> {
+    let mut key = [0u8; 32];
+    rng.fill(&mut key)?;
+    Ok(key)
+}
+
+fn generate_nonce(nonce: u64) -> [u8; 12] {
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes[4..].copy_from_slice(&nonce.to_be_bytes());
+    nonce_bytes
+}
+
+/// Onion encryption state for a circuit
+#[derive(Debug, Clone)]
+pub struct OnionCrypto {
+    forward_key: aead::LessSafeKey,
+    backward_key: aead::LessSafeKey,
+    forward_nonce: u64,
+    backward_nonce: u64,
+}
+
+impl OnionCrypto {
+    pub fn new() -> Result<Self, CryptoError> {
+        let rng = rand::SystemRandom::new();
+
+        // Generate initial keys
+        let forward_key = generate_aead_key(&rng)?;
+        let backward_key = generate_aead_key(&rng)?;
+
+        Ok(Self {
+            forward_key: aead::LessSafeKey::new(UnboundKey::new(&aead::AES_256_GCM, &forward_key)?),
+            backward_key: aead::LessSafeKey::new(UnboundKey::new(&aead::AES_256_GCM, &backward_key)?),
+            forward_nonce: 0,
+            backward_nonce: 0,
+        })
+    }
+
+    /// Encrypt data for forward direction
+    pub fn encrypt_forward(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let nonce = generate_nonce(self.forward_nonce);
+        self.forward_nonce += 1;
+
+        let mut in_out = plaintext.to_vec();
+        let tag = self.forward_key.seal_in_place_separate_tag(
+            aead::Nonce::assume_unique_for_key(nonce),
+            aead::Aad::empty(),
+            &mut in_out
+        )?;
+
+        in_out.extend_from_slice(tag.as_ref());
+        Ok(in_out)
+    }
+
+    /// Decrypt data from forward direction
+    pub fn decrypt_forward(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let nonce = generate_nonce(self.forward_nonce);
+        self.forward_nonce += 1;
+
+        let mut in_out = ciphertext.to_vec();
+        self.forward_key.open_in_place(
+            aead::Nonce::assume_unique_for_key(nonce),
+            aead::Aad::empty(),
+            &mut in_out
+        )?;
+
+        Ok(in_out)
+    }
+}
+
+
+================================================
+FILE: src/directory/mod.rs
+================================================
+
+// src/directory/mod.rs
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime};
+use tokio::sync::RwLock;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsensusSignature {
+    pub algorithm: String,
+    pub identity: String,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub enum DirectoryError {
+    NoSuitableRelays,
+    RequestFailed,
+    InvalidConsensus,
+}
+
+impl std::fmt::Display for DirectoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DirectoryError::NoSuitableRelays => write!(f, "No suitable relays found"),
+            DirectoryError::RequestFailed => write!(f, "Request to directory authority failed"),
+            DirectoryError::InvalidConsensus => write!(f, "Invalid consensus received"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayDescriptor {
+    pub id: String,
+    pub nickname: String,
+    pub address: std::net::SocketAddr,
+    pub identity_key: Vec<u8>,
+    pub onion_key: Vec<u8>,
+    pub bandwidth: u32,
+    pub flags: Vec<RelayFlag>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RelayFlag {
+    Exit,
+    Guard,
+    Fast,
+    Stable,
+    // ... other flags
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConsensus {
+    pub valid_after: SystemTime,
+    pub valid_until: SystemTime,
+    pub relays: HashMap<String, RelayDescriptor>,
+    pub signatures: Vec<ConsensusSignature>,
+}
+
+#[derive(Debug)]
+pub struct DirectoryClient {
+    authorities: Vec<String>,
+    consensus: RwLock<Option<NetworkConsensus>>,
+    last_update: RwLock<SystemTime>,
+}
+
+impl DirectoryClient {
+    pub fn new(authorities: Vec<String>) -> Self {
+        Self {
+            authorities,
+            consensus: RwLock::new(None),
+            last_update: RwLock::new(SystemTime::UNIX_EPOCH),
+        }
+    }
+
+    async fn is_consensus_fresh(&self) -> bool {
+        todo!()
+    }
+
+    async fn fetch_from_authority(&self, authority: &str) -> Result<NetworkConsensus, DirectoryError> {
+        todo!()
+    }
+
+    async fn validate_consensus(&self, candidates: Vec<NetworkConsensus>) -> Result<NetworkConsensus, DirectoryError> {
+        todo!()
+    }
+
+    fn is_relay_suitable(&self, relay: &RelayDescriptor, hop_number: usize) -> bool {
+        todo!()
+    }
+
+    fn select_weighted_relay(&self, relays: Vec<&RelayDescriptor>) -> Result<RelayDescriptor, DirectoryError> {
+        todo!()
+    }
+    
+    /// Fetch and validate network consensus
+    pub async fn fetch_consensus(&self) -> Result<NetworkConsensus, DirectoryError> {
+        // Check if we have a recent consensus
+        if self.is_consensus_fresh().await {
+            if let Some(consensus) = self.consensus.read().await.as_ref() {
+                return Ok(consensus.clone());
+            }
+        }
+        
+        // Fetch from directory authorities
+        let mut consensus_candidates = Vec::new();
+        
+        for authority in &self.authorities {
+            match self.fetch_from_authority(authority).await {
+                Ok(consensus) => consensus_candidates.push(consensus),
+                Err(e) => log::warn!("Failed to fetch from {}: {}", authority, e),
+            }
+        }
+        
+        // Validate and select consensus
+        let consensus = self.validate_consensus(consensus_candidates).await?;
+        
+        // Update cache
+        *self.consensus.write().await = Some(consensus.clone());
+        *self.last_update.write().await = SystemTime::now();
+        
+        Ok(consensus)
+    }
+    
+    /// Select appropriate relay for a specific hop position
+    pub async fn select_relay(&self, hop_number: usize) -> Result<RelayDescriptor, DirectoryError> {
+        let consensus = self.fetch_consensus().await?;
+        
+        let suitable_relays: Vec<&RelayDescriptor> = consensus.relays
+            .values()
+            .filter(|relay| self.is_relay_suitable(relay, hop_number))
+            .collect();
+        
+        if suitable_relays.is_empty() {
+            return Err(DirectoryError::NoSuitableRelays);
+        }
+        
+        // Weighted random selection based on bandwidth
+        self.select_weighted_relay(suitable_relays)
+    }
+}
+
+
+
+================================================
+FILE: src/proxy/http.rs
+================================================
+
+pub struct HttpProxy;
+
+
+
+================================================
+FILE: src/proxy/mod.rs
+================================================
+
+pub mod socks5;
+pub mod http;
+
+
+
+================================================
+FILE: src/proxy/socks5.rs
+================================================
+
+// src/proxy/socks5.rs
+use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use crate::circuit::CircuitManager;
+
+#[derive(Debug)]
+pub enum ProxyError {
+    InvalidVersion(u8),
+    Io(std::io::Error),
+    Circuit(crate::circuit::CircuitError),
+}
+
+impl From<std::io::Error> for ProxyError {
+    fn from(err: std::io::Error) -> Self {
+        ProxyError::Io(err)
+    }
+}
+
+impl From<crate::circuit::CircuitError> for ProxyError {
+    fn from(err: crate::circuit::CircuitError) -> Self {
+        ProxyError::Circuit(err)
+    }
+}
+
+#[derive(Debug)]
+pub struct Socks5Proxy {
+    bind_address: String,
+    circuit_manager: Arc<CircuitManager>,
+    directory_client: Arc<crate::directory::DirectoryClient>,
+}
+
+impl Socks5Proxy {
+    pub fn new(
+        bind_address: String,
+        circuit_manager: Arc<CircuitManager>,
+        directory_client: Arc<crate::directory::DirectoryClient>,
+    ) -> Self {
+        Self {
+            bind_address,
+            circuit_manager,
+            directory_client,
+        }
+    }
+
+    pub async fn run(&self) -> Result<(), ProxyError> {
+        let listener = TcpListener::bind(&self.bind_address).await?;
+        log::info!("SOCKS5 proxy listening on {}", self.bind_address);
+
+        loop {
+            let (stream, _addr) = listener.accept().await?;
+            let circuit_manager = self.circuit_manager.clone();
+            let directory_client = self.directory_client.clone();
+            tokio::spawn(async move {
+                if let Err(e) = Self::handle_client(stream, circuit_manager, directory_client).await {
+                    log::error!("Client handling error: {:?}", e);
+                }
+            });
+        }
+    }
+
+    async fn handle_client(
+        mut stream: TcpStream,
+        circuit_manager: Arc<CircuitManager>,
+        directory_client: Arc<crate::directory::DirectoryClient>,
+    ) -> Result<(), ProxyError> {
+        // SOCKS5 handshake
+        Self::perform_handshake(&mut stream).await?;
+
+        // Parse SOCKS5 request
+        let request = Self::parse_request(&mut stream).await?;
+
+        // Create circuit for this connection
+        let circuit_id = circuit_manager.create_circuit(3, &directory_client).await?;
+
+        // Route traffic through circuit
+        Self::relay_traffic(stream, circuit_id, circuit_manager, request).await?;
+
+        Ok(())
+    }
+    
+    async fn perform_handshake(stream: &mut TcpStream) -> Result<(), ProxyError> {
+        // Read version and methods
+        let mut buf = [0u8; 2];
+        stream.read_exact(&mut buf).await?;
+        
+        let version = buf[0];
+        let nmethods = buf[1] as usize;
+        
+        if version != 0x05 {
+            return Err(ProxyError::InvalidVersion(version));
+        }
+        
+        // Read methods
+        let mut methods = vec![0u8; nmethods];
+        stream.read_exact(&mut methods).await?;
+        
+        // Accept no authentication
+        stream.write_all(&[0x05, 0x00]).await?;
+        
+        Ok(())
+    }
+
+    async fn parse_request(stream: &mut TcpStream) -> Result<Socks5Request, ProxyError> {
+        todo!()
+    }
+
+    async fn relay_traffic(
+        stream: TcpStream,
+        circuit_id: u32,
+        circuit_manager: Arc<CircuitManager>,
+        request: Socks5Request,
+    ) -> Result<(), ProxyError> {
+        todo!()
+    }
+}
+
+pub struct Socks5Request {
+    // ...
+}
+
+
+
+================================================
+FILE: tests/integration/full_circuit.rs
+================================================
+
+// tests/integration/full_circuit.rs
+use tor_client::{TorClient, TorConfig};
+
+#[tokio::test]
+async fn test_complete_tor_flow() {
+    let config = TorConfig::test_config();
+    let client = TorClient::start(config).await.unwrap();
+    
+    // Test HTTP request through Tor
+    // let response = client.http_get("http://example.com").await;
+    // assert!(response.is_ok());
+    
+    // client.shutdown().await;
+}
+
+
+
+================================================
+FILE: tests/unit/crypto_tests.rs
+================================================
+
+// tests/unit/crypto_tests.rs
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_onion_encryption_roundtrip() {
+        let mut crypto = OnionCrypto::new().unwrap();
+        let plaintext = b"test message";
+        
+        let encrypted = crypto.encrypt_forward(plaintext).unwrap();
+        let decrypted = crypto.decrypt_forward(&encrypted).unwrap();
+        
+        assert_eq!(plaintext, decrypted.as_slice());
+    }
+    
+    #[tokio::test]
+    async fn test_circuit_creation() {
+        let manager = CircuitManager::new();
+        let directory = MockDirectory::new();
+        
+        let circuit_id = manager.create_circuit(3, &directory).await.unwrap();
+        assert!(circuit_id > 0);
+    }
+}
+
+
