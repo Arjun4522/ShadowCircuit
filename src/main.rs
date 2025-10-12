@@ -16,8 +16,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         socks_port: 9050,
         control_port: 9051,
         directory_authorities: vec![
-            "authority1.example.com:80".to_string(),
-            "authority2.example.com:80".to_string(),
+            // These are some of the real Tor directory authorities.
+            // A full list can be found in the Tor source code.
+            "86.59.21.38:80".to_string(), // tor26
+            "45.66.33.45:80".to_string(), // dizum
+            "131.188.40.189:80".to_string(), // gabelmoo
+            "199.58.81.140:80".to_string(), // longclaw
         ],
         ..Default::default()
     };

@@ -1,4 +1,3 @@
-
 // src/circuit/mod.rs
 use crate::crypto::OnionCrypto;
 use crate::directory::DirectoryClient;
@@ -79,12 +78,17 @@ impl CircuitManager {
             id
         };
         
+        log::info!("Creating circuit {} with {} hops", circuit_id, num_hops);
+        
         let mut hops = Vec::with_capacity(num_hops);
         
         // Select relays for each hop
         for hop_num in 0..num_hops {
+            log::debug!("Selecting relay for hop {}", hop_num);
             let relay = directory.select_relay(hop_num).await?;
             let crypto = OnionCrypto::new()?;
+            
+            log::info!("Selected relay {} for hop {}", relay.nickname, hop_num);
             
             hops.push(RelayHop {
                 relay_id: relay.id,
@@ -111,14 +115,24 @@ impl CircuitManager {
         // Mark circuit as ready
         if let Some(circuit) = self.circuits.write().await.get_mut(&circuit_id) {
             circuit.state = CircuitState::Ready;
+            log::info!("Circuit {} is ready", circuit_id);
         }
         
         Ok(circuit_id)
     }
     
-    async fn perform_handshakes(&self, circuit_id: CircuitId) -> Result<(), CircuitError> {
-        // Implementation of CREATE, EXTEND, and crypto handshakes
-        // with each relay in the circuit
-        todo!("Implement circuit handshake protocol")
+    async fn perform_handshakes(&self, _circuit_id: CircuitId) -> Result<(), CircuitError> {
+        // Mock implementation - in real Tor, this would:
+        // 1. Connect to first relay with CREATE cell
+        // 2. Perform DH handshake
+        // 3. Send EXTEND cells through circuit for each additional hop
+        // 4. Each hop performs DH handshake
+        
+        log::info!("Performing handshakes (mock implementation)");
+        
+        // Simulate some network delay
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        
+        Ok(())
     }
 }
