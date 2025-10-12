@@ -1,0 +1,12 @@
+
+# config.yaml
+data_directory: /var/lib/tor-client
+socks_port: 9050
+control_port: 9051
+directory_authorities:
+  - "authority1.torproject.org:80"
+  - "authority2.torproject.org:80"
+entry_guards:
+  - "guard1.example.com:443"
+  - "guard2.example.com:443"
+log_level: "info"
