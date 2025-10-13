@@ -24,6 +24,10 @@ base64 = "0.21"
 hex = "0.4"
 humantime = "2.1"
 chrono = "0.4"
+rand_core = "0.6"
+bytes = "1.0"
+hkdf = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 mockall = "0.11"
@@ -34,6 +38,16 @@ tokio-test = "0.4"
 [[test]]
 name = "integration"
 path = "tests/integration/full_circuit.rs"
+harness = true
+
+[[test]]
+name = "handshake"
+path = "tests/integration/handshake_test.rs"
+harness = true
+
+[[test]]
+name = "handshake_unit"
+path = "tests/unit/handshake_unit_tests.rs"
 harness = true
 
 [package.metadata.fuzz]

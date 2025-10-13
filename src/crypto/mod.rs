@@ -2,10 +2,14 @@
 use ring::{aead, rand};
 use ring::aead::UnboundKey;
 use ring::rand::SecureRandom;
+use hkdf::Hkdf;
+use sha2::Sha256;
+use x25519_dalek::{PublicKey, EphemeralSecret};
 
 #[derive(Debug)]
 pub enum CryptoError {
     RingError(ring::error::Unspecified),
+    NtorError(String),
 }
 
 impl From<ring::error::Unspecified> for CryptoError {
@@ -51,6 +55,15 @@ impl OnionCrypto {
         })
     }
 
+    pub fn from_ntor_keys(keys: NtorKeys) -> Result<Self, CryptoError> {
+        Ok(Self {
+            forward_key: aead::LessSafeKey::new(UnboundKey::new(&aead::AES_256_GCM, &keys.forward_key)?),
+            backward_key: aead::LessSafeKey::new(UnboundKey::new(&aead::AES_256_GCM, &keys.backward_key)?),
+            forward_nonce: 0,
+            backward_nonce: 0,
+        })
+    }
+
     /// Encrypt data for forward direction
     pub fn encrypt_forward(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let nonce = generate_nonce(self.forward_nonce);
@@ -81,4 +94,40 @@ impl OnionCrypto {
 
         Ok(in_out)
     }
+}
+
+
+pub struct NtorKeys {
+    pub forward_key: [u8; 32],
+    pub backward_key: [u8; 32],
+}
+
+pub fn ntor_handshake(
+    client_private_key: EphemeralSecret,
+    client_public_key: &PublicKey,
+    server_public_key: &PublicKey,
+    relay_identity_key: &[u8],
+    relay_onion_key: &[u8],
+) -> Result<(NtorKeys, Vec<u8>), CryptoError> {
+    // ECDH calculation
+    let ecdh_secret = client_private_key.diffie_hellman(server_public_key);
+
+    let mut secret_input = Vec::new();
+    secret_input.extend_from_slice(ecdh_secret.as_bytes());
+    secret_input.extend_from_slice(relay_identity_key);
+    secret_input.extend_from_slice(relay_onion_key);
+    secret_input.extend_from_slice(client_public_key.as_bytes());
+    secret_input.extend_from_slice(server_public_key.as_bytes());
+    secret_input.extend_from_slice(b"ntor-curve25519-sha256-1");
+
+    let prk = Hkdf::<Sha256>::new(Some(b"ntor-curve25519-sha256-1"), &secret_input);
+
+    let mut okm = [0u8; 96];
+    prk.expand(b"ntor-kdf-expand", &mut okm).map_err(|_| CryptoError::NtorError("HKDF expand failed".to_string()))?;
+
+    let forward_key: [u8; 32] = okm[0..32].try_into().unwrap();
+    let backward_key: [u8; 32] = okm[32..64].try_into().unwrap();
+    let auth: Vec<u8> = okm[64..96].to_vec();
+
+    Ok((NtorKeys { forward_key, backward_key }, auth))
 }
