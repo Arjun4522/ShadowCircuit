@@ -88,7 +88,14 @@ impl CircuitManager {
             let relay = directory.select_relay(hop_num).await?;
             let crypto = OnionCrypto::new()?;
             
-            log::info!("Selected relay {} for hop {}", relay.nickname, hop_num);
+            log::info!(
+                "Selected relay for hop {}: {} (Address: {}, Bandwidth: {}, Flags: {:?})",
+                hop_num,
+                relay.nickname,
+                relay.address,
+                relay.bandwidth,
+                relay.flags
+            );
             
             hops.push(RelayHop {
                 relay_id: relay.id,
