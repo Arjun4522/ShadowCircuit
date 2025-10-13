@@ -53,7 +53,11 @@ Expected: Full HTML response from example.com (direct relay).
 ### Testing
 
 ```bash
+# Native test
 cargo test
+
+# Or Docker test
+docker run --rm tor-client cargo test -- --nocapture
 ```
 
 ## Architecture

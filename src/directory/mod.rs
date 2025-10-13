@@ -51,6 +51,7 @@ pub struct RelayDescriptor {
 pub enum RelayFlag {
     Exit,
     Guard,
+    Middle,
     Fast,
     Stable,
     Running,
@@ -173,7 +174,6 @@ impl DirectoryClient {
             ("Guard1", "192.168.1.1:9001", vec![RelayFlag::Guard, RelayFlag::Fast, RelayFlag::Running, RelayFlag::Valid], 1000000),
             ("Middle1", "192.168.1.2:9001", vec![RelayFlag::Fast, RelayFlag::Stable, RelayFlag::Running, RelayFlag::Valid], 2000000),
             ("Exit1", "192.168.1.3:9001", vec![RelayFlag::Exit, RelayFlag::Fast, RelayFlag::Running, RelayFlag::Valid], 3000000),
-            // ... add 7 more similar
             ("Guard2", "192.168.1.4:9001", vec![RelayFlag::Guard, RelayFlag::Fast, RelayFlag::Running, RelayFlag::Valid], 1500000),
             ("Middle2", "192.168.1.5:9001", vec![RelayFlag::Fast, RelayFlag::Stable, RelayFlag::Running, RelayFlag::Valid], 2500000),
             ("Exit2", "192.168.1.6:9001", vec![RelayFlag::Exit, RelayFlag::Fast, RelayFlag::Running, RelayFlag::Valid], 3500000),
@@ -257,7 +257,7 @@ impl DirectoryClient {
         }
 
         let nickname = parts[1].to_string();
-        let identity_full = parts[2];  // Unpadded base64, e.g., "/bi8Q7vSJkjbGdiXSx30Cae/DtI"
+        let identity_full = parts[2];  // Unpadded base64
         let _digest = parts[3];  // Base64 digest, unused
         let _published_date = parts[4];  // "YYYY-MM-DD", unused
         let _published_time = parts[5];  // "HH:MM:SS", unused
@@ -322,10 +322,12 @@ impl DirectoryClient {
             flags,
         })
     }
+
     fn parse_flags(&self, line: &str) -> Vec<RelayFlag> {
         line.split_whitespace().skip(1).map(|flag| match flag {
             "Exit" => RelayFlag::Exit,
             "Guard" => RelayFlag::Guard,
+            "Middle" => RelayFlag::Middle,
             "Fast" => RelayFlag::Fast,
             "Stable" => RelayFlag::Stable,
             "Running" => RelayFlag::Running,
@@ -354,7 +356,17 @@ impl DirectoryClient {
         }
         match hop {
             0 => relay.flags.contains(&RelayFlag::Guard) && relay.flags.contains(&RelayFlag::Fast),
-            1 => relay.flags.contains(&RelayFlag::Fast) && relay.flags.contains(&RelayFlag::Stable),
+            1 => {
+                // If relay has explicit Middle flag, use it
+                if relay.flags.contains(&RelayFlag::Middle) {
+                    return relay.flags.contains(&RelayFlag::Fast);
+                }
+                // Otherwise, middle relay = Fast + Stable, not Guard, not Exit
+                relay.flags.contains(&RelayFlag::Fast) 
+                    && relay.flags.contains(&RelayFlag::Stable)
+                    && !relay.flags.contains(&RelayFlag::Guard)
+                    && !relay.flags.contains(&RelayFlag::Exit)
+            },
             2 => relay.flags.contains(&RelayFlag::Exit) && relay.flags.contains(&RelayFlag::Fast),
             _ => relay.flags.contains(&RelayFlag::Fast),
         }
