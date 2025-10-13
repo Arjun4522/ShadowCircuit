@@ -1,10 +1,9 @@
-
 // src/lib.rs
 
 use std::sync::Arc;
 
-pub use circuit::{CircuitId, CircuitManager};
-pub use directory::DirectoryClient;
+pub use circuit::{CircuitId, CircuitManager, CircuitError};
+pub use directory::{DirectoryClient, DirectoryError};
 // pub use proxy::ProxyServer;
 
 #[derive(Debug, Clone)]
@@ -53,9 +52,18 @@ pub struct TorClient {
 impl TorClient {
     pub async fn start(config: TorConfig) -> Result<Self, TorError> {
         let circuit_manager = Arc::new(CircuitManager::new());
-        let directory_client = Arc::new(DirectoryClient::new(config.directory_authorities));
+        
+        // Create directory client with real authorities or mock for testing
+        let directory_client = if config.directory_authorities.is_empty() {
+            log::warn!("No directory authorities configured, using mock directory");
+            Arc::new(DirectoryClient::new_mock())
+        } else {
+            log::info!("Using real directory authorities");
+            Arc::new(DirectoryClient::new(config.directory_authorities))
+        };
+        
         let socks5_proxy = Socks5Proxy::new(
-            format!("127.0.0.1:{}", config.socks_port),
+            format!("0.0.0.0:{}", config.socks_port),
             circuit_manager.clone(),
             directory_client.clone(),
         );
@@ -68,33 +76,60 @@ impl TorClient {
     }
 
     pub async fn create_circuit(&self, num_hops: usize) -> Result<CircuitId, TorError> {
-        // self.circuit_manager.create_circuit(num_hops, &self.directory_client).await.map_err(|e| TorError::Circuit(e))
-        todo!()
+        self.circuit_manager
+            .create_circuit(num_hops, &self.directory_client)
+            .await
+            .map_err(TorError::Circuit)
     }
 
     pub async fn http_get(&self, url: &str) -> Result<String, TorError> {
-        todo!()
+        // Create a circuit first
+        let _circuit_id = self.create_circuit(3).await?;
+        
+        // TODO: Route HTTP request through the circuit
+        // For now, this is a placeholder
+        log::warn!("HTTP GET not fully implemented, URL: {}", url);
+        Err(TorError::NotImplemented("HTTP GET through Tor circuit".to_string()))
     }
 
     pub async fn shutdown(self) {
-        todo!()
+        log::info!("Shutting down TorClient");
+        // TODO: Cleanup circuits, close connections
     }
 }
 
 #[derive(Debug)]
 pub enum TorError {
-    // Circuit(CircuitError),
-    // Directory(DirectoryError),
-    // Proxy(ProxyError),
+    Circuit(CircuitError),
+    Directory(DirectoryError),
+    Proxy(crate::proxy::socks5::ProxyError),
+    NotImplemented(String),
 }
 
 impl std::fmt::Display for TorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TorError")
+        match self {
+            TorError::Circuit(e) => write!(f, "Circuit error: {:?}", e),
+            TorError::Directory(e) => write!(f, "Directory error: {}", e),
+            TorError::Proxy(e) => write!(f, "Proxy error: {:?}", e),
+            TorError::NotImplemented(s) => write!(f, "Not implemented: {}", s),
+        }
     }
 }
 
 impl std::error::Error for TorError {}
+
+impl From<CircuitError> for TorError {
+    fn from(err: CircuitError) -> Self {
+        TorError::Circuit(err)
+    }
+}
+
+impl From<DirectoryError> for TorError {
+    fn from(err: DirectoryError) -> Self {
+        TorError::Directory(err)
+    }
+}
 
 pub mod circuit;
 pub mod crypto;

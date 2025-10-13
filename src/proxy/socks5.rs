@@ -49,15 +49,24 @@ impl Socks5Proxy {
         log::info!("SOCKS5 proxy listening on {}", self.bind_address);
 
         loop {
-            let (stream, addr) = listener.accept().await?;
-            log::info!("New connection from {}", addr);
-            let circuit_manager = self.circuit_manager.clone();
-            let directory_client = self.directory_client.clone();
-            tokio::spawn(async move {
-                if let Err(e) = Self::handle_client(stream, circuit_manager, directory_client).await {
-                    log::error!("Client handling error: {:?}", e);
+            match listener.accept().await {
+                Ok((stream, addr)) => {
+                    log::info!("New connection from {}", addr);
+                    let circuit_manager = self.circuit_manager.clone();
+                    let directory_client = self.directory_client.clone();
+                    
+                    tokio::spawn(async move {
+                        log::debug!("Spawned handler for {}", addr);
+                        match Self::handle_client(stream, circuit_manager, directory_client).await {
+                            Ok(_) => log::info!("Client {} handled successfully", addr),
+                            Err(e) => log::error!("Client {} handling error: {:?}", addr, e),
+                        }
+                    });
                 }
-            });
+                Err(e) => {
+                    log::error!("Failed to accept connection: {}", e);
+                }
+            }
         }
     }
 
@@ -79,7 +88,7 @@ impl Socks5Proxy {
         
         log::info!("SOCKS5 request: {}:{}", request.host, request.port);
 
-        // For now, create a circuit (which will work with mock relays)
+        // Create a circuit
         log::debug!("Creating circuit");
         match circuit_manager.create_circuit(3, &directory_client).await {
             Ok(circuit_id) => {
@@ -90,8 +99,83 @@ impl Socks5Proxy {
                 log::debug!("Response sent");
                 
                 // TODO: Actually relay traffic through circuit
-                // For now, just close the connection
-                log::warn!("Traffic relay not yet implemented, closing connection");
+                // For now, simulate a basic HTTP response for testing
+                log::info!("Attempting to connect to {}:{}", request.host, request.port);
+                
+                // Try to connect directly (just for testing purposes)
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    TcpStream::connect(format!("{}:{}", request.host, request.port))
+                ).await {
+                    Ok(Ok(target)) => {
+                        log::info!("Connected to target, relaying traffic");
+                        
+                        // Simple bidirectional relay (not through Tor circuit yet)
+                        let (mut client_read, mut client_write) = stream.into_split();
+                        let (mut target_read, mut target_write) = target.into_split();
+                        
+                        // Spawn task for client -> target
+                        let client_to_target = tokio::spawn(async move {
+                            let mut buf = [0u8; 8192];
+                            let mut total_bytes = 0;
+                            loop {
+                                match client_read.read(&mut buf).await {
+                                    Ok(0) => {
+                                        log::debug!("Client closed connection (sent {} bytes)", total_bytes);
+                                        break;
+                                    }
+                                    Ok(n) => {
+                                        total_bytes += n;
+                                        if let Err(e) = target_write.write_all(&buf[..n]).await {
+                                            log::error!("Error writing to target: {}", e);
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!("Error reading from client: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                        
+                        // Spawn task for target -> client
+                        let target_to_client = tokio::spawn(async move {
+                            let mut buf = [0u8; 8192];
+                            let mut total_bytes = 0;
+                            loop {
+                                match target_read.read(&mut buf).await {
+                                    Ok(0) => {
+                                        log::debug!("Target closed connection (received {} bytes)", total_bytes);
+                                        break;
+                                    }
+                                    Ok(n) => {
+                                        total_bytes += n;
+                                        if let Err(e) = client_write.write_all(&buf[..n]).await {
+                                            log::error!("Error writing to client: {}", e);
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!("Error reading from target: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                        
+                        // Wait for both tasks to complete
+                        let _ = tokio::join!(client_to_target, target_to_client);
+                        log::info!("Connection relay finished");
+                    }
+                    Ok(Err(e)) => {
+                        log::error!("Failed to connect to target: {}", e);
+                        // Connection already established, can't send failure response
+                    }
+                    Err(_) => {
+                        log::error!("Timeout connecting to target");
+                    }
+                }
             }
             Err(e) => {
                 log::error!("Failed to create circuit: {:?}", e);
@@ -104,6 +188,8 @@ impl Socks5Proxy {
     }
     
     async fn perform_handshake(stream: &mut TcpStream) -> Result<(), ProxyError> {
+        log::debug!("Reading SOCKS5 version and method count");
+        
         // Read version and methods
         let mut buf = [0u8; 2];
         stream.read_exact(&mut buf).await?;
@@ -111,7 +197,10 @@ impl Socks5Proxy {
         let version = buf[0];
         let nmethods = buf[1] as usize;
         
+        log::debug!("SOCKS5 version: {}, nmethods: {}", version, nmethods);
+        
         if version != 0x05 {
+            log::error!("Invalid SOCKS version: {}", version);
             return Err(ProxyError::InvalidVersion(version));
         }
         
@@ -122,12 +211,17 @@ impl Socks5Proxy {
         log::debug!("SOCKS5 handshake: version={}, methods={:?}", version, methods);
         
         // Accept no authentication (0x00)
+        log::debug!("Sending handshake response");
         stream.write_all(&[0x05, 0x00]).await?;
+        stream.flush().await?;
+        log::debug!("Handshake response sent");
         
         Ok(())
     }
 
     async fn parse_request(stream: &mut TcpStream) -> Result<Socks5Request, ProxyError> {
+        log::debug!("Reading SOCKS5 request header");
+        
         // Read request header
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf).await?;
@@ -136,6 +230,8 @@ impl Socks5Proxy {
         let cmd = buf[1];
         let _reserved = buf[2];
         let atyp = buf[3];
+        
+        log::debug!("Request: version={}, cmd={}, atyp={}", version, cmd, atyp);
         
         if version != 0x05 {
             return Err(ProxyError::InvalidVersion(version));
@@ -178,10 +274,14 @@ impl Socks5Proxy {
         stream.read_exact(&mut port_buf).await?;
         let port = u16::from_be_bytes(port_buf);
         
+        log::debug!("Parsed request: {}:{}", host, port);
+        
         Ok(Socks5Request { host, port })
     }
 
     async fn send_response(stream: &mut TcpStream, status: u8) -> Result<(), ProxyError> {
+        log::debug!("Sending SOCKS5 response with status {}", status);
+        
         // Send SOCKS5 response
         // VER | REP | RSV | ATYP | BND.ADDR | BND.PORT
         let response = [
@@ -193,6 +293,9 @@ impl Socks5Proxy {
             0, 0,  // Bind port (0)
         ];
         stream.write_all(&response).await?;
+        stream.flush().await?;
+        log::debug!("SOCKS5 response sent");
+        
         Ok(())
     }
 }
