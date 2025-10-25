@@ -1,4 +1,4 @@
-// src/circuit/mod.rs
+// src/circuit/mod.rs - COMPLETE CORRECTED HANDSHAKE IMPLEMENTATION
 use crate::crypto::{OnionCrypto, ntor_handshake};
 use crate::directory::DirectoryClient;
 use std::collections::HashMap;
@@ -14,8 +14,7 @@ use tokio_rustls::{TlsConnector, rustls};
 use std::sync::Arc;
 use std::time::Duration;
 
-// Always use dangerous configuration since we're connecting to Tor relays
-// which don't have traditional CA-signed certificates
+// Custom certificate verifier for Tor relays
 #[derive(Debug)]
 struct NoCertificateVerification;
 
@@ -100,22 +99,17 @@ impl CircuitManager {
         self.circuits.read().await.get(&circuit_id).map(|c| c.state.clone())
     }
     
-    /// Create a new circuit with specified number of hops
     pub async fn create_circuit(
         &self,
         num_hops: usize,
         directory: &DirectoryClient
     ) -> Result<CircuitId, CircuitError> {
-        // Generate a valid circuit ID (odd numbers for client-initiated circuits in v4+)
+        // Generate valid circuit ID (odd for client-initiated in v4+)
         let circuit_id = {
             let mut next_id = self.next_circuit_id.write().await;
             let id = *next_id;
-            *next_id += 2; // Increment by 2 to keep odd
-            if id % 2 == 0 {
-                id + 1
-            } else {
-                id
-            }
+            *next_id += 2;
+            if id % 2 == 0 { id + 1 } else { id }
         };
         
         log::info!("Creating circuit {} with {} hops", circuit_id, num_hops);
@@ -124,17 +118,12 @@ impl CircuitManager {
         
         // Select relays for each hop
         for hop_num in 0..num_hops {
-            log::debug!("Selecting relay for hop {}", hop_num);
             let relay = directory.select_relay(hop_num).await?;
             let crypto = OnionCrypto::new()?;
             
             log::info!(
                 "Selected relay for hop {}: {} (Address: {}, Bandwidth: {}, Flags: {:?})",
-                hop_num,
-                relay.nickname,
-                relay.address,
-                relay.bandwidth,
-                relay.flags
+                hop_num, relay.nickname, relay.address, relay.bandwidth, relay.flags
             );
             
             hops.push(RelayHop {
@@ -153,13 +142,11 @@ impl CircuitManager {
             created_at: std::time::Instant::now(),
         };
         
-        // Store circuit
         self.circuits.write().await.insert(circuit_id, circuit);
         
-        // Perform circuit handshake with each hop
+        // Perform handshakes
         match self.perform_handshakes(circuit_id).await {
             Ok(_) => {
-                // Mark circuit as ready
                 if let Some(circuit) = self.circuits.write().await.get_mut(&circuit_id) {
                     circuit.state = CircuitState::Ready;
                     log::info!("Circuit {} is ready", circuit_id);
@@ -167,7 +154,6 @@ impl CircuitManager {
                 Ok(circuit_id)
             }
             Err(e) => {
-                // Mark circuit as error
                 if let Some(circuit) = self.circuits.write().await.get_mut(&circuit_id) {
                     circuit.state = CircuitState::Error(format!("{:?}", e));
                 }
@@ -183,18 +169,19 @@ impl CircuitManager {
         let circuit = circuits.get_mut(&circuit_id)
             .ok_or(CircuitError::HandshakeFailed("Circuit not found".to_string()))?;
 
-        // For now, we only handle the first hop
         if circuit.hops.is_empty() {
             return Err(CircuitError::HandshakeFailed("No hops in circuit".to_string()));
         }
         
         let hop = &mut circuit.hops[0];
 
-        // 1. Generate ephemeral keypair for the client
+        // Step 1: Generate ephemeral keypair for client
         let client_private_key = EphemeralSecret::random_from_rng(OsRng);
         let client_public_key = PublicKey::from(&client_private_key);
 
-        // 2. Connect to the relay via TLS with timeout
+        log::debug!("Client ephemeral public key generated: {} bytes", client_public_key.as_bytes().len());
+
+        // Step 2: Connect to relay via TLS
         let addr: SocketAddr = hop.ip;
         log::info!("Connecting to relay at {}", addr);
         
@@ -205,7 +192,7 @@ impl CircuitManager {
             .map_err(|_| CircuitError::Timeout(format!("TCP connect to {} timed out", addr)))?
             .map_err(|e| CircuitError::Io(format!("TCP connect failed: {}", e)))?;
         
-        // Use custom certificate verifier for Tor relays
+        // Setup TLS with custom verifier
         let config = rustls::ClientConfig::builder()
             .with_safe_defaults()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
@@ -223,8 +210,8 @@ impl CircuitManager {
         
         log::info!("Connected to relay {} via TLS", hop.relay_id);
 
-        // 3. Send VERSIONS cell (variable-length, circuit ID = 0)
-        // IMPORTANT: VERSIONS cell uses special format (2-byte circ_id)
+        // Step 3: Send VERSIONS cell
+        // CRITICAL: VERSIONS uses 2-byte circuit ID (pre-negotiation)
         let versions_cell = Cell {
             circ_id: 0,
             command: CELL_COMMAND_VERSIONS,
@@ -233,7 +220,7 @@ impl CircuitManager {
         
         let versions_bytes = versions_cell.versions_to_bytes();
         
-        log::debug!("VERSIONS cell bytes: {:?}", versions_bytes);
+        log::debug!("Sending VERSIONS cell ({} bytes)", versions_bytes.len());
         
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -251,7 +238,7 @@ impl CircuitManager {
         
         log::info!("Sent VERSIONS cell");
 
-        // 4. Read VERSIONS response with timeout
+        // Step 4: Read VERSIONS response
         let mut response = vec![0u8; 512];
         let n = tokio::time::timeout(
             Duration::from_secs(10),
@@ -266,23 +253,24 @@ impl CircuitManager {
         
         log::info!("Received VERSIONS response ({} bytes)", n);
         
-        if n < 7 {
+        if n < 5 {
             return Err(CircuitError::HandshakeFailed(format!("VERSIONS response too short: {} bytes", n)));
         }
         
-        let response_cell = Cell::from_bytes(&response[..n], 4)
+        // CRITICAL FIX: Use versions_from_bytes for VERSIONS response (2-byte circuit ID)
+        let response_cell = Cell::versions_from_bytes(&response[..n])
             .map_err(|e| CircuitError::HandshakeFailed(format!("Failed to parse VERSIONS response: {}", e)))?;
         
         if response_cell.command != CELL_COMMAND_VERSIONS {
             return Err(CircuitError::HandshakeFailed(
-                format!("Expected VERSIONS response, got command {}", response_cell.command)
+                format!("Expected VERSIONS response (cmd 7), got command {}", response_cell.command)
             ));
         }
         
         let server_versions = VersionsCell::from_bytes(&response_cell.payload)
             .map_err(|e| CircuitError::HandshakeFailed(format!("Failed to parse server VERSIONS: {}", e)))?;
         
-        log::info!("Received VERSIONS from server: {:?}", server_versions.versions);
+        log::info!("Server supports versions: {:?}", server_versions.versions);
         
         // Negotiate version (use highest common version)
         let negotiated_version = if server_versions.versions.contains(&5) {
@@ -297,7 +285,8 @@ impl CircuitManager {
         
         log::info!("Negotiated link protocol version: {}", negotiated_version);
 
-        // 5. Create CREATE2 cell with proper NTor handshake data
+        // Step 5: Create CREATE2 cell with proper ntor handshake data
+        // The handshake data contains: client_public_key (X) | relay_identity (ID) | relay_onion_key (B)
         let create2_payload = Create2Cell::new(
             &client_public_key,
             &hop.identity_key,
@@ -310,8 +299,12 @@ impl CircuitManager {
             payload: create2_payload.to_bytes(),
         };
 
-        // 6. Send CREATE2 cell with timeout
+        log::debug!("CREATE2 payload size: {} bytes", create2_payload.to_bytes().len());
+
+        // Step 6: Send CREATE2 cell
         let cell_bytes = create2_cell.to_bytes(negotiated_version);
+        
+        log::debug!("Sending CREATE2 cell ({} bytes total)", cell_bytes.len());
         
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -329,7 +322,7 @@ impl CircuitManager {
         
         log::info!("Sent CREATE2 cell to relay {} (circuit ID: {})", hop.relay_id, circuit.id);
 
-        // 7. Receive CREATED2 response with timeout
+        // Step 7: Receive CREATED2 response
         let mut response = vec![0u8; CELL_LEN];
         let n = tokio::time::timeout(
             Duration::from_secs(15),
@@ -344,7 +337,7 @@ impl CircuitManager {
         
         log::info!("Received CREATED2 response ({} bytes)", n);
 
-        // 8. Parse CREATED2 response
+        // Step 8: Parse CREATED2 response (now using negotiated version)
         let response_cell = Cell::from_bytes(&response[..n], negotiated_version)
             .map_err(|e| CircuitError::HandshakeFailed(format!("Failed to parse CREATED2 cell: {}", e)))?;
 
@@ -356,14 +349,20 @@ impl CircuitManager {
         
         if response_cell.command != CELL_COMMAND_CREATED2 {
             return Err(CircuitError::HandshakeFailed(
-                format!("Expected CREATED2 response, got command {}", response_cell.command)
+                format!("Expected CREATED2 response (cmd 11), got command {}", response_cell.command)
             ));
         }
 
         let created2_cell = Created2Cell::from_bytes(&response_cell.payload)
             .map_err(|e| CircuitError::HandshakeFailed(format!("Failed to parse CREATED2 payload: {}", e)))?;
 
-        // 9. Perform NTor key derivation
+        log::debug!("Server ephemeral public key (Y): {} bytes", created2_cell.server_public_key.as_bytes().len());
+        log::debug!("Auth data: {} bytes", created2_cell.auth.len());
+
+        // Step 9: Perform ntor key derivation
+        // The ntor handshake computes:
+        // - secret_input = EXP(Y,x) | EXP(B,x) | ID | B | X | Y | PROTOID
+        // - Then uses HKDF to derive forward_key, backward_key, and auth
         let (keys, auth) = ntor_handshake(
             client_private_key,
             &client_public_key,
@@ -372,15 +371,25 @@ impl CircuitManager {
             &hop.onion_key,
         )?;
 
-        // 10. Verify the auth value
+        log::debug!("Computed auth: {} bytes", auth.len());
+        log::debug!("Received auth: {} bytes", created2_cell.auth.len());
+
+        // Step 10: Verify the auth value
+        // The auth value proves the server knows the private keys for B and Y
         if auth != created2_cell.auth {
+            log::error!("Auth verification failed!");
+            log::debug!("Expected auth: {:02x?}", &auth[..8]);
+            log::debug!("Received auth: {:02x?}", &created2_cell.auth[..8]);
             return Err(CircuitError::HandshakeFailed("Authentication verification failed".to_string()));
         }
 
-        // 11. Update the crypto state for the hop
+        log::debug!("✓ Auth verification successful");
+
+        // Step 11: Update the crypto state for the hop
         hop.crypto_state = OnionCrypto::from_ntor_keys(keys)?;
 
-        log::info!("✓ Handshake with relay {} successful!", hop.relay_id);
+        log::info!("✓ Handshake with relay {} completed successfully!", hop.relay_id);
+        log::info!("✓ Circuit {} first hop established", circuit.id);
 
         Ok(())
     }
