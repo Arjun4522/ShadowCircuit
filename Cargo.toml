@@ -28,6 +28,8 @@ rand_core = "0.6"
 bytes = "1.0"
 hkdf = "0.12"
 sha2 = "0.10"
+tokio-rustls = "0.24"
+rustls = "0.21"
 
 [dev-dependencies]
 mockall = "0.11"

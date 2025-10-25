@@ -5,6 +5,7 @@ use x25519_dalek::PublicKey;
 pub const CELL_COMMAND_CREATE2: u8 = 10;
 pub const CELL_COMMAND_CREATED2: u8 = 11;
 pub const CELL_COMMAND_RELAY: u8 = 3;
+pub const CELL_COMMAND_VERSIONS: u8 = 7;
 
 #[derive(Debug, Clone)]
 pub struct Cell {
@@ -66,6 +67,40 @@ impl Created2Cell {
             server_public_key,
             auth,
         })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VersionsCell {
+    pub versions: Vec<u16>,
+}
+
+impl VersionsCell {
+    pub fn new(versions: Vec<u16>) -> Self {
+        Self { versions }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for &v in &self.versions {
+            bytes.extend_from_slice(&v.to_be_bytes());
+        }
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let mut versions = Vec::new();
+        for chunk in bytes.chunks(2) {
+            if chunk.len() != 2 {
+                break;
+            }
+            let v = u16::from_be_bytes(chunk.try_into().unwrap());
+            if v == 0 {
+                break;
+            }
+            versions.push(v);
+        }
+        Ok(Self { versions })
     }
 }
 

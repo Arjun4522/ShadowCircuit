@@ -2,12 +2,32 @@
 use crate::crypto::{OnionCrypto, ntor_handshake};
 use crate::directory::DirectoryClient;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use tokio::sync::RwLock;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use x25519_dalek::{EphemeralSecret, PublicKey};
-use crate::network::cells::{Cell, Create2Cell, Created2Cell, CELL_COMMAND_CREATE2, CELL_COMMAND_CREATED2};
+use crate::network::cells::{Cell, Create2Cell, Created2Cell, VersionsCell, CELL_COMMAND_CREATE2, CELL_COMMAND_CREATED2, CELL_COMMAND_VERSIONS};
 use rand_core::OsRng;
+use tokio_rustls::{TlsConnector, rustls};
+use std::sync::Arc;
+
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+impl rustls::client::ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: std::time::SystemTime,
+    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::ServerCertVerified::assertion())
+    }
+}
 
 #[derive(Debug)]
 pub enum CircuitError {
@@ -160,8 +180,48 @@ impl CircuitManager {
         };
 
         // 3. Connect to the relay
-        let mut stream = TcpStream::connect(hop.ip).await.map_err(|e| CircuitError::Io(e.to_string()))?;
-        log::info!("Connected to relay {}", hop.relay_id);
+        let addr: SocketAddr = hop.ip.parse().map_err(|e| CircuitError::Io(format!("Invalid address: {}", e)))?;
+        let tcp_stream = TcpStream::connect(addr).await.map_err(|e| CircuitError::Io(e.to_string()))?;
+        let mut config = rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(config));
+        let server_name = rustls::ServerName::IpAddress(addr.ip().into());
+        let mut stream = connector.connect(server_name, tcp_stream).await.map_err(|e| CircuitError::Io(format!("TLS error: {}", e)))?;
+        log::info!("Connected to relay {} via TLS", hop.relay_id);
+
+        // 3.1. Send VERSIONS cell
+        let versions_cell_payload = VersionsCell::new(vec![3, 4, 5]).to_bytes();
+        let versions_cell = Cell {
+            circ_id: 0,
+            command: CELL_COMMAND_VERSIONS,
+            payload: versions_cell_payload,
+        };
+        let mut versions_cell_bytes = Vec::with_capacity(514);
+        versions_cell_bytes.extend_from_slice(&versions_cell.circ_id.to_be_bytes());
+        versions_cell_bytes.push(versions_cell.command);
+        versions_cell_bytes.extend_from_slice(&versions_cell.payload);
+        versions_cell_bytes.resize(514, 0);
+        stream.write_all(&versions_cell_bytes).await.map_err(|e| CircuitError::Io(format!("Failed to send VERSIONS: {}", e)))?;
+        log::info!("Sent VERSIONS cell");
+
+        // 3.2. Read VERSIONS response
+        let mut response = vec![0; 514];
+        let n = stream.read(&mut response).await.map_err(|e| CircuitError::Io(format!("Failed to read VERSIONS response: {}", e)))?;
+        if n != 514 {
+            return Err(CircuitError::HandshakeFailed("Invalid response size for VERSIONS".to_string()));
+        }
+        let response_circ_id = u32::from_be_bytes(response[0..4].try_into().unwrap());
+        let response_command = response[4];
+        if response_circ_id != 0 || response_command != CELL_COMMAND_VERSIONS {
+            return Err(CircuitError::HandshakeFailed("Invalid VERSIONS response".to_string()));
+        }
+        let server_versions = VersionsCell::from_bytes(&response[5..514]).map_err(|e| CircuitError::HandshakeFailed(format!("Failed to parse server VERSIONS: {}", e)))?;
+        log::info!("Received VERSIONS from server: {:?}", server_versions.versions);
+        // Negotiate version (use 4 if supported)
+        let negotiated_version = if server_versions.versions.contains(&4) { 4 } else { 3 };
+        log::info!("Negotiated link version: {}", negotiated_version);
 
         // 4. Serialize the cell and send it
         let mut cell_bytes = Vec::with_capacity(514);
