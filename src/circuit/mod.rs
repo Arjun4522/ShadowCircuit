@@ -1,4 +1,4 @@
-// src/circuit/mod.rs - COMPLETE HANDSHAKE WITH CERTS/NETINFO HANDLING
+// src/circuit/mod.rs - COMPLETE HANDSHAKE WITH FIXED CIRCUIT ID
 use crate::crypto::OnionCrypto;
 use crate::crypto::ntor;
 use crate::directory::DirectoryClient;
@@ -99,7 +99,8 @@ impl CircuitManager {
     pub fn new() -> Self {
         Self {
             circuits: RwLock::new(HashMap::new()),
-            next_circuit_id: RwLock::new(1),
+            // CRITICAL FIX: Start at 0x80000001 (MSB=1 for client-initiated, odd for client)
+            next_circuit_id: RwLock::new(0x80000001),
         }
     }
 
@@ -114,12 +115,31 @@ impl CircuitManager {
     ) -> Result<CircuitId, CircuitError> {
         let circuit_id = {
             let mut next_id = self.next_circuit_id.write().await;
-            let id = *next_id;
-            *next_id += 2;
-            if id % 2 == 0 { id + 1 } else { id }
+            let mut id = *next_id;
+            
+            // CRITICAL: In link protocol 4+, the node that initiated the connection
+            // (the client) MUST set MSB to 1. CircID must be >= 0x80000000
+            if id < 0x80000000 {
+                id = 0x80000001;
+            }
+            
+            // Ensure CircID is odd (clients use odd, relays use even)
+            if id % 2 == 0 {
+                id += 1;
+            }
+            
+            // Store next ID (increment by 2 to stay odd)
+            *next_id = id + 2;
+            
+            // Wrap around but stay in MSB=1 range
+            if *next_id >= 0xFFFFFFFF {
+                *next_id = 0x80000001;
+            }
+            
+            id
         };
         
-        log::info!("Creating circuit {} with {} hops", circuit_id, num_hops);
+        log::info!("Creating circuit {} (0x{:08X}) with {} hops", circuit_id, circuit_id, num_hops);
         
         let mut hops = Vec::with_capacity(num_hops);
         
@@ -168,7 +188,7 @@ impl CircuitManager {
     }
     
     async fn perform_handshakes(&self, circuit_id: CircuitId) -> Result<(), CircuitError> {
-        log::info!("Performing handshakes for circuit {}", circuit_id);
+        log::info!("Performing handshakes for circuit {} (0x{:08X})", circuit_id, circuit_id);
 
         let mut circuits = self.circuits.write().await;
         let circuit = circuits.get_mut(&circuit_id)
@@ -272,15 +292,11 @@ impl CircuitManager {
         
         log::info!("Negotiated link protocol version: {}", negotiated_version);
 
-        // ===== NEW: Handle CERTS, AUTH_CHALLENGE, NETINFO cells =====
-        // After VERSIONS, the relay sends these cells before we can send CREATE2
-        
-        // Read and process intermediate cells (CERTS, AUTH_CHALLENGE, NETINFO)
-        let mut max_cells = 10; // Prevent infinite loop
+        // Handle CERTS, AUTH_CHALLENGE, NETINFO cells
+        let mut max_cells = 10;
 
         while max_cells > 0 {
             max_cells -= 1;
-            // Read cell header first (5 or 7 bytes depending on version)
             let header_size = if negotiated_version >= 4 { 5 } else { 3 };
             let mut header = vec![0u8; header_size];
             
@@ -291,22 +307,19 @@ impl CircuitManager {
                 .map_err(|_| CircuitError::Timeout("Reading cell header timed out".to_string()))?
                 .map_err(|e| CircuitError::Io(format!("Failed to read cell header: {}", e)))?;
             
-            // Parse header to get circuit ID and command
             let (circ_id, command) = if negotiated_version >= 4 {
                 let circ_id = u32::from_be_bytes(header[0..4].try_into().unwrap());
                 let command = header[4];
                 (circ_id, command)
             } else {
-        let _circ_id = u16::from_be_bytes(header[0..2].try_into().unwrap()) as u32;
+                let circ_id = u16::from_be_bytes(header[0..2].try_into().unwrap()) as u32;
                 let command = header[2];
                 (circ_id, command)
             };
             
             log::debug!("Received cell with command: {}", command);
             
-            // Variable-length cells (>= 128) have a 2-byte length field
             let payload = if command >= 128 {
-                // Read 2-byte payload length
                 let mut len_bytes = [0u8; 2];
                 tokio::time::timeout(
                     Duration::from_secs(10),
@@ -318,7 +331,6 @@ impl CircuitManager {
                 let payload_len = u16::from_be_bytes(len_bytes) as usize;
                 log::debug!("Variable-length cell, payload length: {}", payload_len);
                 
-                // Read the full payload
                 let mut payload = vec![0u8; payload_len];
                 tokio::time::timeout(
                     Duration::from_secs(10),
@@ -329,7 +341,6 @@ impl CircuitManager {
                 
                 payload
             } else {
-                // Fixed-length cell: 509 bytes payload (514 - 5 header)
                 let payload_len = CELL_LEN - header_size;
                 let mut payload = vec![0u8; payload_len];
                 tokio::time::timeout(
@@ -353,15 +364,12 @@ impl CircuitManager {
             match cell.command {
                 CELL_COMMAND_CERTS => {
                     log::debug!("Received CERTS cell ({} bytes payload)", cell.payload.len());
-                    // We can ignore CERTS for now (certificate chain validation)
                 }
                 CELL_COMMAND_AUTH_CHALLENGE => {
                     log::debug!("Received AUTH_CHALLENGE cell ({} bytes payload)", cell.payload.len());
-                    // We can ignore AUTH_CHALLENGE (we're not authenticating)
                 }
                 CELL_COMMAND_NETINFO => {
                     log::info!("Received NETINFO cell ({} bytes payload)", cell.payload.len());
-                    // Reply with our own NETINFO cell using the same circ_id as received
                     let netinfo_response = self.create_netinfo_cell(cell.circ_id, &addr)?;
                     let netinfo_bytes = netinfo_response.to_bytes(negotiated_version);
 
@@ -374,22 +382,18 @@ impl CircuitManager {
 
                     stream.flush().await.map_err(|e| CircuitError::Io(format!("Flush failed: {}", e)))?;
                     log::info!("Sent NETINFO response");
-
-                    // After NETINFO exchange, we can send CREATE2
                     break;
                 }
                 CELL_COMMAND_VPADDING => {
                     log::debug!("Received VPADDING cell (padding, ignoring)");
-                    // Just padding, ignore
                 }
                 _ => {
                     log::warn!("Received unexpected cell with command {} while waiting for NETINFO", cell.command);
-                    // Don't break - some relays send other cells, we just ignore them
                 }
             }
         }
         
-        // Now send CREATE2
+        // Now send CREATE2 with the CORRECT circuit ID
         let create2_payload = Create2Cell::new(
             &client_public_key,
             &hop.identity_key,
@@ -397,12 +401,14 @@ impl CircuitManager {
         ).map_err(|e| CircuitError::HandshakeFailed(format!("Failed to create CREATE2 cell: {}", e)))?;
         
         let create2_cell = Cell {
-            circ_id: circuit.id,
+            circ_id: circuit.id, // This is now >= 0x80000000 with MSB=1!
             command: CELL_COMMAND_CREATE2,
             payload: create2_payload.to_bytes(),
         };
 
         let cell_bytes = create2_cell.to_bytes(negotiated_version);
+        
+        log::info!("Sending CREATE2 cell: CircID=0x{:08X} ({} bytes)", circuit.id, cell_bytes.len());
         
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -412,7 +418,7 @@ impl CircuitManager {
             .map_err(|e| CircuitError::Io(format!("Failed to send CREATE2: {}", e)))?;
         
         stream.flush().await.map_err(|e| CircuitError::Io(format!("Flush failed: {}", e)))?;
-        log::info!("Sent CREATE2 cell to relay {} (circuit ID: {})", hop.relay_id, circuit.id);
+        log::info!("Sent CREATE2 cell to relay {} (circuit ID: 0x{:08X})", hop.relay_id, circuit.id);
 
         // Receive CREATED2 response
         let mut response = vec![0u8; CELL_LEN];
@@ -440,7 +446,7 @@ impl CircuitManager {
 
         if response_cell.circ_id != circuit.id {
             return Err(CircuitError::HandshakeFailed(
-                format!("Circuit ID mismatch: expected {}, got {}", circuit.id, response_cell.circ_id)
+                format!("Circuit ID mismatch: expected 0x{:08X}, got 0x{:08X}", circuit.id, response_cell.circ_id)
             ));
         }
 
@@ -470,40 +476,33 @@ impl CircuitManager {
         hop.crypto_state = OnionCrypto::from_ntor_keys(keys)?;
 
         log::info!("✓ Handshake with relay {} completed successfully!", hop.relay_id);
-        log::info!("✓ Circuit {} first hop established", circuit.id);
+        log::info!("✓ Circuit {} (0x{:08X}) first hop established", circuit.id, circuit.id);
 
         Ok(())
     }
     
-    /// Create a NETINFO cell to send to the relay
     fn create_netinfo_cell(&self, circ_id: u32, relay_addr: &SocketAddr) -> Result<Cell, CircuitError> {
         let mut payload = Vec::new();
         
-        // Timestamp (4 bytes) - current Unix timestamp
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as u32;
         payload.extend_from_slice(&timestamp.to_be_bytes());
         
-        // Other's address (relay's address as we see it)
-        // Type: 1 byte (0x04 = IPv4, 0x06 = IPv6)
-        // Length: 1 byte
-        // Address: 4 or 16 bytes
         match relay_addr.ip() {
             std::net::IpAddr::V4(ipv4) => {
-                payload.push(0x04); // IPv4
-                payload.push(4);    // Length
+                payload.push(0x04);
+                payload.push(4);
                 payload.extend_from_slice(&ipv4.octets());
             }
             std::net::IpAddr::V6(ipv6) => {
-                payload.push(0x06); // IPv6
-                payload.push(16);   // Length
+                payload.push(0x06);
+                payload.push(16);
                 payload.extend_from_slice(&ipv6.octets());
             }
         }
         
-        // Number of our addresses (1 byte) - we say 0 for simplicity
         payload.push(0);
         
         Ok(Cell {

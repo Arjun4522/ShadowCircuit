@@ -1,4 +1,4 @@
-use tor_client::crypto::ntor_handshake;
+use tor_client::crypto::ntor::ntor_handshake;
 use tor_client::network::cells::{Create2Cell, Created2Cell};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 use rand_core::OsRng;
@@ -11,20 +11,16 @@ fn test_ntor_handshake() {
     let server_private_key = EphemeralSecret::random_from_rng(OsRng);
     let server_public_key = PublicKey::from(&server_private_key);
 
-    let relay_identity_key = [1u8; 32];
-    let relay_onion_key = [2u8; 32];
+    let relay_identity_key = [1u8; 20];  // 20 bytes for identity
+    let relay_onion_key = [2u8; 32];     // 32 bytes for onion key
 
-    let result = ntor_handshake(
+    let (keys, auth) = ntor_handshake(
         client_private_key,
         &client_public_key,
         &server_public_key,
         &relay_identity_key,
         &relay_onion_key,
     );
-
-    assert!(result.is_ok());
-
-    let (keys, auth) = result.unwrap();
 
     assert_ne!(keys.forward_key, [0u8; 32]);
     assert_ne!(keys.backward_key, [0u8; 32]);
@@ -59,9 +55,11 @@ fn test_create2_cell_to_bytes() {
 
     let hdata = &bytes[4..];
     assert_eq!(hdata.len(), 84);
-    assert_eq!(&hdata[0..32], client_public_key.as_bytes());
-    assert_eq!(&hdata[32..52], &relay_identity);
-    assert_eq!(&hdata[52..84], &relay_onion_key);
+    
+    // ntor format: NODEID (20) | KEYID (32) | CLIENT_PK (32)
+    assert_eq!(&hdata[0..20], &relay_identity);
+    assert_eq!(&hdata[20..52], &relay_onion_key);
+    assert_eq!(&hdata[52..84], client_public_key.as_bytes());
 }
 
 #[test]
@@ -120,30 +118,23 @@ fn test_create2_cell_validation() {
 
 #[test]
 fn test_ntor_handshake_deterministic() {
-    // Test that the same inputs produce the same outputs
+    // Test that the same inputs produce reasonable outputs
     let client_private_key = EphemeralSecret::random_from_rng(OsRng);
     let client_public_key = PublicKey::from(&client_private_key);
 
     let server_private_key = EphemeralSecret::random_from_rng(OsRng);
     let server_public_key = PublicKey::from(&server_private_key);
 
-    let relay_identity_key = [1u8; 32];
+    let relay_identity_key = [1u8; 20];
     let relay_onion_key = [2u8; 32];
 
-    // Clone the private key for second test
-    // Note: We can't actually clone EphemeralSecret, so this test just verifies
-    // that the function runs successfully
-    
-    let result1 = ntor_handshake(
+    let (keys1, auth1) = ntor_handshake(
         client_private_key,
         &client_public_key,
         &server_public_key,
         &relay_identity_key,
         &relay_onion_key,
     );
-
-    assert!(result1.is_ok());
-    let (keys1, auth1) = result1.unwrap();
     
     // Verify outputs are reasonable
     assert_eq!(keys1.forward_key.len(), 32);

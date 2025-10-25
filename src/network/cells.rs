@@ -158,6 +158,12 @@ pub struct Create2Cell {
 
 impl Create2Cell {
     /// Create a new CREATE2 cell with proper NTor handshake data
+    /// 
+    /// According to Tor spec (tor-spec section 5.1.4), the ntor handshake client message is:
+    /// - NODEID: Server identity digest (ID_LENGTH = 20 bytes)
+    /// - KEYID: KEYID(B) where B is the ntor onion key (H_LENGTH = 32 bytes)
+    /// - CLIENT_KP: Client's ephemeral public key X (G_LENGTH = 32 bytes)
+    /// Total: 84 bytes
     pub fn new(
         client_public_key: &PublicKey,
         relay_identity: &[u8],
@@ -170,11 +176,14 @@ impl Create2Cell {
             return Err(format!("Relay onion key must be 32 bytes, got {}", relay_onion_key.len()));
         }
         
-        let mut handshake_data = Vec::with_capacity(32);
-        handshake_data.extend_from_slice(client_public_key.as_bytes());
+        // ntor handshake client message format: NODEID | KEYID(B) | CLIENT_KP
+        let mut handshake_data = Vec::with_capacity(84);
+        handshake_data.extend_from_slice(relay_identity);           // 20 bytes - NODEID (server identity digest)
+        handshake_data.extend_from_slice(relay_onion_key);          // 32 bytes - KEYID(B) (server's ntor onion key)
+        handshake_data.extend_from_slice(client_public_key.as_bytes()); // 32 bytes - CLIENT_KP (client public key X)
         
         Ok(Self {
-            handshake_type: 2, // ntor
+            handshake_type: 2, // ntor handshake type
             handshake_data,
         })
     }
@@ -202,6 +211,7 @@ impl Created2Cell {
         
         let hlen = u16::from_be_bytes(payload[0..2].try_into().unwrap()) as usize;
         
+        // ntor server handshake is 64 bytes: Y (32) + AUTH (32)
         if hlen != 64 {
             log::warn!("Unexpected HLEN in CREATED2 cell: expected 64, got {}", hlen);
         }
@@ -217,6 +227,7 @@ impl Created2Cell {
             return Err(format!("Handshake data too short: expected 64, got {}", hdata.len()));
         }
 
+        // Parse server's response: Y (32 bytes) | AUTH (32 bytes)
         let server_pk_bytes: [u8; 32] = hdata[0..32].try_into()
             .map_err(|_| "Failed to parse server public key from CREATED2")?;
         let server_public_key = PublicKey::from(server_pk_bytes);
@@ -228,7 +239,7 @@ impl Created2Cell {
             auth,
         })
     }
-} // <-- This closing brace was missing!
+}
 
 #[derive(Debug, Clone)]
 pub struct VersionsCell {
@@ -320,9 +331,11 @@ mod tests {
 
         let hdata = &bytes[4..];
         assert_eq!(hdata.len(), 84);
-        assert_eq!(&hdata[0..32], client_public_key.as_bytes());
-        assert_eq!(&hdata[32..52], &relay_identity);
-        assert_eq!(&hdata[52..84], &relay_onion_key);
+        
+        // Verify ntor format: NODEID (20) | KEYID (32) | CLIENT_PK (32)
+        assert_eq!(&hdata[0..20], &relay_identity);
+        assert_eq!(&hdata[20..52], &relay_onion_key);
+        assert_eq!(&hdata[52..84], client_public_key.as_bytes());
     }
 
     #[test]
@@ -345,5 +358,37 @@ mod tests {
         let created2_cell = result.unwrap();
         assert_eq!(created2_cell.server_public_key.as_bytes(), server_public_key.as_bytes());
         assert_eq!(created2_cell.auth, auth.to_vec());
+    }
+
+    #[test]
+    fn test_create2_cell_validation() {
+        let client_private_key = EphemeralSecret::random_from_rng(OsRng);
+        let client_public_key = PublicKey::from(&client_private_key);
+        
+        // Test with wrong identity length
+        let wrong_identity = [1u8; 19]; // Should be 20
+        let relay_onion_key = [2u8; 32];
+        
+        let result = Create2Cell::new(
+            &client_public_key,
+            &wrong_identity,
+            &relay_onion_key
+        );
+        
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("identity must be 20 bytes"));
+        
+        // Test with wrong onion key length
+        let relay_identity = [1u8; 20];
+        let wrong_onion_key = [2u8; 31]; // Should be 32
+        
+        let result = Create2Cell::new(
+            &client_public_key,
+            &relay_identity,
+            &wrong_onion_key
+        );
+        
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("onion key must be 32 bytes"));
     }
 }
