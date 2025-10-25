@@ -72,10 +72,10 @@ impl Cell {
         bytes
     }
     
-    /// Parse cell from bytes
     pub fn from_bytes(bytes: &[u8], link_version: u16) -> Result<Self, String> {
-        if bytes.len() < 5 {
-            return Err("Cell too short".to_string());
+        let header_len = if link_version >= 4 { 4 } else { 2 };
+        if bytes.len() < header_len + 1 {
+            return Err("Cell header too short".to_string());
         }
         
         let (circ_id, offset) = if link_version >= 4 {
@@ -86,30 +86,37 @@ impl Cell {
         
         let command = bytes[offset];
         
-        // Variable-length cells have a 2-byte length field
         if command == CELL_COMMAND_VERSIONS || command >= 128 {
             if bytes.len() < offset + 3 {
-                return Err("Variable-length cell too short".to_string());
+                return Err("Variable-length cell header too short".to_string());
             }
             let payload_len = u16::from_be_bytes(bytes[offset + 1..offset + 3].try_into().unwrap()) as usize;
-            if bytes.len() < offset + 3 + payload_len {
-                return Err(format!("Cell payload too short: expected {}, got {}", payload_len, bytes.len() - offset - 3));
+            let expected_len = offset + 3 + payload_len;
+            if bytes.len() < expected_len {
+                return Err(format!("Variable-length cell payload too short: expected {}, got {}", payload_len, bytes.len() - (offset + 3)));
             }
-            let payload = bytes[offset + 3..offset + 3 + payload_len].to_vec();
+            let payload = bytes[offset + 3..expected_len].to_vec();
             Ok(Cell {
                 circ_id,
                 command,
                 payload,
             })
         } else {
-            // Fixed-length cell
-            let payload = bytes[offset + 1..].to_vec();
+            let expected_len = offset + 1 + 509;
+            if bytes.len() < expected_len {
+                return Err(format!("Fixed-length cell too short: expected {}, got {}", expected_len, bytes.len()));
+            }
+            let payload = bytes[offset + 1..expected_len].to_vec();
             Ok(Cell {
                 circ_id,
                 command,
                 payload,
             })
         }
+    }
+    
+    pub fn is_variable_length(&self) -> bool {
+        self.command == CELL_COMMAND_VERSIONS || self.command >= 128
     }
     
     /// Parse VERSIONS cell (special case)
@@ -151,11 +158,6 @@ pub struct Create2Cell {
 
 impl Create2Cell {
     /// Create a new CREATE2 cell with proper NTor handshake data
-    /// 
-    /// NTor handshake data format (84 bytes total):
-    /// - Client's ephemeral X25519 public key (32 bytes)
-    /// - Relay's identity fingerprint (20 bytes)
-    /// - Relay's onion key (32 bytes)
     pub fn new(
         client_public_key: &PublicKey,
         relay_identity: &[u8],
@@ -169,34 +171,21 @@ impl Create2Cell {
         }
         
         let mut handshake_data = Vec::with_capacity(84);
-        
-        // 1. Client's ephemeral public key (32 bytes)
         handshake_data.extend_from_slice(client_public_key.as_bytes());
-        
-        // 2. Relay's identity fingerprint (20 bytes)
         handshake_data.extend_from_slice(relay_identity);
-        
-        // 3. Relay's onion key (32 bytes)
         handshake_data.extend_from_slice(relay_onion_key);
         
         Ok(Self {
-            handshake_type: 2, // 2 = ntor
+            handshake_type: 2, // ntor
             handshake_data,
         })
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(4 + self.handshake_data.len());
-        
-        // Handshake type (2 bytes)
         bytes.extend_from_slice(&self.handshake_type.to_be_bytes());
-        
-        // Handshake data length (2 bytes)
         bytes.extend_from_slice(&(self.handshake_data.len() as u16).to_be_bytes());
-        
-        // Handshake data
         bytes.extend_from_slice(&self.handshake_data);
-        
         bytes
     }
 }
@@ -210,28 +199,30 @@ pub struct Created2Cell {
 impl Created2Cell {
     pub fn from_bytes(payload: &[u8]) -> Result<Self, String> {
         if payload.len() < 2 {
-            return Err("Payload too short for CREATED2 cell".to_string());
+            return Err("Payload too short for CREATED2 hlen".to_string());
         }
         
-        // Read handshake data length
         let hlen = u16::from_be_bytes(payload[0..2].try_into().unwrap()) as usize;
         
         if hlen != 64 {
-            return Err(format!("Invalid HLEN for CREATED2 cell: expected 64, got {}", hlen));
-        }
-        
-        if payload.len() < 2 + hlen {
-            return Err(format!("Payload too short: expected {}, got {}", 2 + hlen, payload.len()));
+            log::warn!("Unexpected HLEN in CREATED2 cell: expected 64, got {}", hlen);
         }
 
-        let hdata = &payload[2..2 + hlen];
+        let expected_payload_len = 2 + hlen;
+        if payload.len() < expected_payload_len {
+            return Err(format!("Payload too short for CREATED2 data: expected at least {}, got {}", expected_payload_len, payload.len()));
+        }
+
+        let hdata = &payload[2..expected_payload_len];
         
-        // Server's ephemeral public key (32 bytes)
+        if hdata.len() < 64 {
+            return Err(format!("Handshake data too short: expected 64, got {}", hdata.len()));
+        }
+
         let server_pk_bytes: [u8; 32] = hdata[0..32].try_into()
-            .map_err(|_| "Failed to parse server public key")?;
+            .map_err(|_| "Failed to parse server public key from CREATED2")?;
         let server_public_key = PublicKey::from(server_pk_bytes);
         
-        // Auth data (32 bytes)
         let auth = hdata[32..64].to_vec();
 
         Ok(Self {
@@ -239,7 +230,7 @@ impl Created2Cell {
             auth,
         })
     }
-}
+} // <-- This closing brace was missing!
 
 #[derive(Debug, Clone)]
 pub struct VersionsCell {

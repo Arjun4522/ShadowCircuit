@@ -43,6 +43,7 @@ pub struct RelayDescriptor {
     pub address: SocketAddr,
     pub identity_key: Vec<u8>,
     pub onion_key: Vec<u8>,
+    pub microdesc_digest: Option<String>,
     pub bandwidth: u32,
     pub flags: Vec<RelayFlag>,
 }
@@ -192,6 +193,7 @@ impl DirectoryClient {
                 address: addr,
                 identity_key: vec![0u8; 20],  // 20 bytes for identity
                 onion_key: vec![1u8; 32],     // 32 bytes for onion key (FIXED!)
+                microdesc_digest: None,
                 bandwidth: bw,
                 flags,
             });
@@ -238,6 +240,8 @@ impl DirectoryClient {
             return Err(DirectoryError::InvalidConsensus("No relays found".to_string()));
         }
 
+        // Microdescriptors will be fetched on demand in select_relay
+
         Ok(NetworkConsensus {
             valid_after: SystemTime::now(),
             valid_until: SystemTime::now() + Duration::from_secs(3600),
@@ -278,14 +282,22 @@ impl DirectoryClient {
             )));
         }
 
-        // CRITICAL FIX: Generate a proper 32-byte onion key
-        // In a real implementation, this should be fetched from microdescriptors
-        // For now, we derive it deterministically from the identity
-        let onion_key = self.derive_onion_key_from_identity(&identity_key);
+        // Parse microdesc digest
+        let mut microdesc_digest = None;
+        let mut j = *i + 1;
+        if j < lines.len() {
+            let next_line = lines[j].trim();
+            if next_line.starts_with("m ") {
+                let m_parts: Vec<&str> = next_line.split_whitespace().collect();
+                if m_parts.len() >= 2 {
+                    microdesc_digest = Some(m_parts[1].to_string());
+                }
+                j += 1;
+            }
+        }
 
         // Parse flags
         let mut flags = vec![RelayFlag::Running, RelayFlag::Valid];
-        let mut j = *i + 1;
         if j < lines.len() {
             let next_line = lines[j].trim();
             if next_line.starts_with("s ") {
@@ -309,30 +321,107 @@ impl DirectoryClient {
 
         *i = j - 1;
 
+        // For now, use derived key; we'll fetch real microdescs later
+        let onion_key = self.derive_onion_key_from_identity(&identity_key);
+
         Ok(RelayDescriptor {
             id: identity_full.to_string(),
             nickname,
             address,
             identity_key,
             onion_key,
+            microdesc_digest,
             bandwidth,
             flags,
         })
     }
 
+    async fn fetch_microdescriptors(&self, relays: &mut HashMap<String, RelayDescriptor>) -> Result<(), DirectoryError> {
+        log::info!("Fetching microdescriptors for {} relays", relays.len());
+
+        // Collect all microdesc digests
+        let digests: Vec<String> = relays.values()
+            .filter_map(|r| r.microdesc_digest.clone())
+            .collect();
+
+        if digests.is_empty() {
+            log::warn!("No microdesc digests found, using derived keys");
+            return Ok(());
+        }
+
+        // Fetch microdescs sequentially to avoid overwhelming the server
+        for digest in digests {
+            match self.fetch_single_microdesc(&digest).await {
+                Ok(onion_key) => {
+                    // Find relays with this digest and update their onion key
+                    for relay in relays.values_mut() {
+                        if relay.microdesc_digest.as_ref() == Some(&digest) {
+                            relay.onion_key = onion_key.clone();
+                            log::debug!("Updated onion key for relay {}", relay.nickname);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to fetch microdesc {}: {}", digest, e);
+                }
+            }
+        }
+
+        log::info!("Fetched microdescriptors for relays");
+        Ok(())
+    }
+
+    async fn fetch_single_microdesc(&self, digest: &str) -> Result<Vec<u8>, DirectoryError> {
+        let url = format!("https://collector.torproject.org/recent/relay-descriptors/microdescs/{}", digest);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| DirectoryError::RequestFailed(e.to_string()))?;
+
+        let response = client.get(&url).send().await
+            .map_err(|e| DirectoryError::RequestFailed(format!("HTTP: {}", e)))?;
+
+        if !response.status().is_success() {
+            return Err(DirectoryError::RequestFailed(format!("Status: {}", response.status())));
+        }
+
+        let text = response.text().await
+            .map_err(|e| DirectoryError::RequestFailed(format!("Read: {}", e)))?;
+
+        // Parse the ntor-onion-key
+        for line in text.lines() {
+            if line.starts_with("ntor-onion-key ") {
+                let key_b64 = line.trim_start_matches("ntor-onion-key ");
+                let mut key_padded = key_b64.replace('-', "+").replace('_', "/");
+                while key_padded.len() % 4 != 0 {
+                    key_padded.push('=');
+                }
+                let onion_key = general_purpose::STANDARD
+                    .decode(&key_padded)
+                    .map_err(|e| DirectoryError::ParseError(format!("Invalid ntor-onion-key base64: {}", e)))?;
+                if onion_key.len() != 32 {
+                    return Err(DirectoryError::ParseError(format!(
+                        "ntor-onion-key wrong length: {} bytes (expected 32)", onion_key.len()
+                    )));
+                }
+                return Ok(onion_key);
+            }
+        }
+
+        Err(DirectoryError::ParseError("ntor-onion-key not found in microdesc".to_string()))
+    }
+
     /// Derive a deterministic 32-byte onion key from the 20-byte identity
-    /// This is a workaround since we don't fetch microdescriptors
-    /// In production, you should fetch the actual ntor-onion-key from microdescriptors
+    /// This is a fallback when microdescriptors can't be fetched
     fn derive_onion_key_from_identity(&self, identity: &[u8]) -> Vec<u8> {
         use sha2::{Sha256, Digest};
-        
-        // Use SHA256 to expand the 20-byte identity to 32 bytes
-        // Add a domain separator to distinguish this from other uses
+
         let mut hasher = Sha256::new();
         hasher.update(b"tor-onion-key-derive:");
         hasher.update(identity);
         let result = hasher.finalize();
-        
+
         result.to_vec()
     }
 
@@ -428,27 +517,52 @@ impl DirectoryClient {
     }
     
     pub async fn select_relay(&self, hop: usize) -> Result<RelayDescriptor, DirectoryError> {
-        let consensus = self.fetch_consensus().await?;
-        
+        let mut consensus = self.fetch_consensus().await?;
+
         let suitable: Vec<&RelayDescriptor> = consensus.relays.values()
             .filter(|r| self.is_relay_suitable(r, hop))
             .collect();
-        
+
         log::debug!("Found {} suitable relays for hop {}", suitable.len(), hop);
-        
+
         if suitable.is_empty() {
             let fallback: Vec<&RelayDescriptor> = consensus.relays.values()
                 .filter(|r| r.flags.contains(&RelayFlag::Running) && !r.flags.contains(&RelayFlag::BadExit))
                 .collect();
-            
+
             if fallback.is_empty() {
                 return Err(DirectoryError::NoSuitableRelays);
             }
-            
+
             log::warn!("Using fallback for hop {}", hop);
-            return self.select_weighted(fallback);
+            let relay = self.select_weighted(fallback)?;
+            return self.ensure_onion_key(&mut consensus, relay).await;
         }
-        
-        self.select_weighted(suitable)
+
+        let relay = self.select_weighted(suitable)?;
+        self.ensure_onion_key(&mut consensus, relay).await
+    }
+
+    async fn ensure_onion_key(&self, consensus: &mut NetworkConsensus, mut relay: RelayDescriptor) -> Result<RelayDescriptor, DirectoryError> {
+        // If we have a microdesc digest, fetch the real onion key
+        if let Some(digest) = &relay.microdesc_digest {
+            if relay.onion_key == self.derive_onion_key_from_identity(&relay.identity_key) {
+                // Still using derived key, fetch real one
+                match self.fetch_single_microdesc(digest).await {
+                    Ok(real_onion_key) => {
+                        relay.onion_key = real_onion_key;
+                        // Update in consensus
+                        if let Some(r) = consensus.relays.get_mut(&relay.id) {
+                            r.onion_key = relay.onion_key.clone();
+                        }
+                        log::debug!("Fetched real onion key for relay {}", relay.nickname);
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to fetch microdesc for {}: {}, using derived key", relay.nickname, e);
+                    }
+                }
+            }
+        }
+        Ok(relay)
     }
 }
