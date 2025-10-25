@@ -7,11 +7,15 @@ use tokio::sync::RwLock;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use x25519_dalek::{EphemeralSecret, PublicKey};
-use crate::network::cells::{Cell, Create2Cell, Created2Cell, VersionsCell, CELL_COMMAND_CREATE2, CELL_COMMAND_CREATED2, CELL_COMMAND_VERSIONS};
+use crate::network::cells::{Cell, Create2Cell, Created2Cell, VersionsCell, 
+    CELL_COMMAND_CREATE2, CELL_COMMAND_CREATED2, CELL_COMMAND_VERSIONS, CELL_LEN};
 use rand_core::OsRng;
 use tokio_rustls::{TlsConnector, rustls};
 use std::sync::Arc;
+use std::time::Duration;
 
+// Always use dangerous configuration since we're connecting to Tor relays
+// which don't have traditional CA-signed certificates
 #[derive(Debug)]
 struct NoCertificateVerification;
 
@@ -36,6 +40,7 @@ pub enum CircuitError {
     Io(String),
     NoSuitableRelays,
     HandshakeFailed(String),
+    Timeout(String),
 }
 
 impl From<crate::crypto::CryptoError> for CircuitError {
@@ -101,11 +106,16 @@ impl CircuitManager {
         num_hops: usize,
         directory: &DirectoryClient
     ) -> Result<CircuitId, CircuitError> {
+        // Generate a valid circuit ID (odd numbers for client-initiated circuits in v4+)
         let circuit_id = {
             let mut next_id = self.next_circuit_id.write().await;
             let id = *next_id;
-            *next_id += 1;
-            id
+            *next_id += 2; // Increment by 2 to keep odd
+            if id % 2 == 0 {
+                id + 1
+            } else {
+                id
+            }
         };
         
         log::info!("Creating circuit {} with {} hops", circuit_id, num_hops);
@@ -147,110 +157,213 @@ impl CircuitManager {
         self.circuits.write().await.insert(circuit_id, circuit);
         
         // Perform circuit handshake with each hop
-        self.perform_handshakes(circuit_id).await?;
-        
-        // Mark circuit as ready
-        if let Some(circuit) = self.circuits.write().await.get_mut(&circuit_id) {
-            circuit.state = CircuitState::Ready;
-            log::info!("Circuit {} is ready", circuit_id);
+        match self.perform_handshakes(circuit_id).await {
+            Ok(_) => {
+                // Mark circuit as ready
+                if let Some(circuit) = self.circuits.write().await.get_mut(&circuit_id) {
+                    circuit.state = CircuitState::Ready;
+                    log::info!("Circuit {} is ready", circuit_id);
+                }
+                Ok(circuit_id)
+            }
+            Err(e) => {
+                // Mark circuit as error
+                if let Some(circuit) = self.circuits.write().await.get_mut(&circuit_id) {
+                    circuit.state = CircuitState::Error(format!("{:?}", e));
+                }
+                Err(e)
+            }
         }
-        
-        Ok(circuit_id)
     }
     
     async fn perform_handshakes(&self, circuit_id: CircuitId) -> Result<(), CircuitError> {
         log::info!("Performing handshakes for circuit {}", circuit_id);
 
         let mut circuits = self.circuits.write().await;
-        let circuit = circuits.get_mut(&circuit_id).unwrap();
+        let circuit = circuits.get_mut(&circuit_id)
+            .ok_or(CircuitError::HandshakeFailed("Circuit not found".to_string()))?;
 
         // For now, we only handle the first hop
+        if circuit.hops.is_empty() {
+            return Err(CircuitError::HandshakeFailed("No hops in circuit".to_string()));
+        }
+        
         let hop = &mut circuit.hops[0];
 
         // 1. Generate ephemeral keypair for the client
         let client_private_key = EphemeralSecret::random_from_rng(OsRng);
         let client_public_key = PublicKey::from(&client_private_key);
 
-        // 2. Create a CREATE2 cell
-        let create2_cell_payload = Create2Cell::new(&client_public_key);
-        let cell = Cell {
-            circ_id: circuit.id,
-            command: CELL_COMMAND_CREATE2,
-            payload: create2_cell_payload.to_bytes(),
-        };
-
-        // 3. Connect to the relay
-        let addr: SocketAddr = hop.ip.parse().map_err(|e| CircuitError::Io(format!("Invalid address: {}", e)))?;
-        let tcp_stream = TcpStream::connect(addr).await.map_err(|e| CircuitError::Io(e.to_string()))?;
-        let mut config = rustls::ClientConfig::builder()
+        // 2. Connect to the relay via TLS with timeout
+        let addr: SocketAddr = hop.ip;
+        log::info!("Connecting to relay at {}", addr);
+        
+        let tcp_stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            TcpStream::connect(addr)
+        ).await
+            .map_err(|_| CircuitError::Timeout(format!("TCP connect to {} timed out", addr)))?
+            .map_err(|e| CircuitError::Io(format!("TCP connect failed: {}", e)))?;
+        
+        // Use custom certificate verifier for Tor relays
+        let config = rustls::ClientConfig::builder()
             .with_safe_defaults()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
             .with_no_client_auth();
+        
         let connector = TlsConnector::from(Arc::new(config));
         let server_name = rustls::ServerName::IpAddress(addr.ip().into());
-        let mut stream = connector.connect(server_name, tcp_stream).await.map_err(|e| CircuitError::Io(format!("TLS error: {}", e)))?;
+        
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            connector.connect(server_name, tcp_stream)
+        ).await
+            .map_err(|_| CircuitError::Timeout("TLS handshake timed out".to_string()))?
+            .map_err(|e| CircuitError::Io(format!("TLS connect failed: {}", e)))?;
+        
         log::info!("Connected to relay {} via TLS", hop.relay_id);
 
-        // 3.1. Send VERSIONS cell
-        let versions_cell_payload = VersionsCell::new(vec![3, 4, 5]).to_bytes();
+        // 3. Send VERSIONS cell (variable-length, circuit ID = 0)
+        // IMPORTANT: VERSIONS cell uses special format (2-byte circ_id)
         let versions_cell = Cell {
             circ_id: 0,
             command: CELL_COMMAND_VERSIONS,
-            payload: versions_cell_payload,
+            payload: VersionsCell::new(vec![3, 4, 5]).to_bytes(),
         };
-        let mut versions_cell_bytes = Vec::with_capacity(514);
-        versions_cell_bytes.extend_from_slice(&versions_cell.circ_id.to_be_bytes());
-        versions_cell_bytes.push(versions_cell.command);
-        versions_cell_bytes.extend_from_slice(&versions_cell.payload);
-        versions_cell_bytes.resize(514, 0);
-        stream.write_all(&versions_cell_bytes).await.map_err(|e| CircuitError::Io(format!("Failed to send VERSIONS: {}", e)))?;
+        
+        let versions_bytes = versions_cell.versions_to_bytes();
+        
+        log::debug!("VERSIONS cell bytes: {:?}", versions_bytes);
+        
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stream.write_all(&versions_bytes)
+        ).await
+            .map_err(|_| CircuitError::Timeout("Sending VERSIONS timed out".to_string()))?
+            .map_err(|e| CircuitError::Io(format!("Failed to send VERSIONS: {}", e)))?;
+        
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stream.flush()
+        ).await
+            .map_err(|_| CircuitError::Timeout("Flushing VERSIONS timed out".to_string()))?
+            .map_err(|e| CircuitError::Io(format!("Failed to flush VERSIONS: {}", e)))?;
+        
         log::info!("Sent VERSIONS cell");
 
-        // 3.2. Read VERSIONS response
-        let mut response = vec![0; 514];
-        let n = stream.read(&mut response).await.map_err(|e| CircuitError::Io(format!("Failed to read VERSIONS response: {}", e)))?;
-        if n != 514 {
-            return Err(CircuitError::HandshakeFailed("Invalid response size for VERSIONS".to_string()));
+        // 4. Read VERSIONS response with timeout
+        let mut response = vec![0u8; 512];
+        let n = tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.read(&mut response)
+        ).await
+            .map_err(|_| CircuitError::Timeout("Reading VERSIONS response timed out".to_string()))?
+            .map_err(|e| CircuitError::Io(format!("Failed to read VERSIONS response: {}", e)))?;
+        
+        if n == 0 {
+            return Err(CircuitError::HandshakeFailed("Connection closed after VERSIONS".to_string()));
         }
-        let response_circ_id = u32::from_be_bytes(response[0..4].try_into().unwrap());
-        let response_command = response[4];
-        if response_circ_id != 0 || response_command != CELL_COMMAND_VERSIONS {
-            return Err(CircuitError::HandshakeFailed("Invalid VERSIONS response".to_string()));
+        
+        log::info!("Received VERSIONS response ({} bytes)", n);
+        
+        if n < 7 {
+            return Err(CircuitError::HandshakeFailed(format!("VERSIONS response too short: {} bytes", n)));
         }
-        let server_versions = VersionsCell::from_bytes(&response[5..514]).map_err(|e| CircuitError::HandshakeFailed(format!("Failed to parse server VERSIONS: {}", e)))?;
+        
+        let response_cell = Cell::from_bytes(&response[..n], 4)
+            .map_err(|e| CircuitError::HandshakeFailed(format!("Failed to parse VERSIONS response: {}", e)))?;
+        
+        if response_cell.command != CELL_COMMAND_VERSIONS {
+            return Err(CircuitError::HandshakeFailed(
+                format!("Expected VERSIONS response, got command {}", response_cell.command)
+            ));
+        }
+        
+        let server_versions = VersionsCell::from_bytes(&response_cell.payload)
+            .map_err(|e| CircuitError::HandshakeFailed(format!("Failed to parse server VERSIONS: {}", e)))?;
+        
         log::info!("Received VERSIONS from server: {:?}", server_versions.versions);
-        // Negotiate version (use 4 if supported)
-        let negotiated_version = if server_versions.versions.contains(&4) { 4 } else { 3 };
-        log::info!("Negotiated link version: {}", negotiated_version);
+        
+        // Negotiate version (use highest common version)
+        let negotiated_version = if server_versions.versions.contains(&5) {
+            5
+        } else if server_versions.versions.contains(&4) {
+            4
+        } else if server_versions.versions.contains(&3) {
+            3
+        } else {
+            return Err(CircuitError::HandshakeFailed("No compatible link protocol version".to_string()));
+        };
+        
+        log::info!("Negotiated link protocol version: {}", negotiated_version);
 
-        // 4. Serialize the cell and send it
-        let mut cell_bytes = Vec::with_capacity(514);
-        cell_bytes.extend_from_slice(&cell.circ_id.to_be_bytes());
-        cell_bytes.push(cell.command);
-        cell_bytes.extend_from_slice(&cell.payload);
-        cell_bytes.resize(514, 0);
+        // 5. Create CREATE2 cell with proper NTor handshake data
+        let create2_payload = Create2Cell::new(
+            &client_public_key,
+            &hop.identity_key,
+            &hop.onion_key
+        ).map_err(|e| CircuitError::HandshakeFailed(format!("Failed to create CREATE2 cell: {}", e)))?;
+        
+        let create2_cell = Cell {
+            circ_id: circuit.id,
+            command: CELL_COMMAND_CREATE2,
+            payload: create2_payload.to_bytes(),
+        };
 
-        stream.write_all(&cell_bytes).await.map_err(|e| CircuitError::Io(e.to_string()))?;
-        log::info!("Sent CREATE2 cell to relay {}", hop.relay_id);
+        // 6. Send CREATE2 cell with timeout
+        let cell_bytes = create2_cell.to_bytes(negotiated_version);
+        
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stream.write_all(&cell_bytes)
+        ).await
+            .map_err(|_| CircuitError::Timeout("Sending CREATE2 timed out".to_string()))?
+            .map_err(|e| CircuitError::Io(format!("Failed to send CREATE2: {}", e)))?;
+        
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stream.flush()
+        ).await
+            .map_err(|_| CircuitError::Timeout("Flushing CREATE2 timed out".to_string()))?
+            .map_err(|e| CircuitError::Io(format!("Failed to flush CREATE2: {}", e)))?;
+        
+        log::info!("Sent CREATE2 cell to relay {} (circuit ID: {})", hop.relay_id, circuit.id);
 
-        // 5. Receive the response
-        let mut response = vec![0; 514];
-        let n = stream.read(&mut response).await.map_err(|e| CircuitError::Io(e.to_string()))?;
-        log::info!("Received {} bytes from relay {}", n, hop.relay_id);
+        // 7. Receive CREATED2 response with timeout
+        let mut response = vec![0u8; CELL_LEN];
+        let n = tokio::time::timeout(
+            Duration::from_secs(15),
+            stream.read(&mut response)
+        ).await
+            .map_err(|_| CircuitError::Timeout("Reading CREATED2 response timed out".to_string()))?
+            .map_err(|e| CircuitError::Io(format!("Failed to read CREATED2 response: {}", e)))?;
+        
+        if n == 0 {
+            return Err(CircuitError::HandshakeFailed("Connection closed after CREATE2".to_string()));
+        }
+        
+        log::info!("Received CREATED2 response ({} bytes)", n);
 
-        // 6. Parse the response
-        let response_cell = &response[..n];
-        let response_circ_id = u32::from_be_bytes(response_cell[0..4].try_into().unwrap());
-        let response_command = response_cell[4];
-        let response_payload = &response_cell[5..];
+        // 8. Parse CREATED2 response
+        let response_cell = Cell::from_bytes(&response[..n], negotiated_version)
+            .map_err(|e| CircuitError::HandshakeFailed(format!("Failed to parse CREATED2 cell: {}", e)))?;
 
-        if response_circ_id != circuit.id || response_command != CELL_COMMAND_CREATED2 {
-            return Err(CircuitError::HandshakeFailed("Invalid response from relay".to_string()));
+        if response_cell.circ_id != circuit.id {
+            return Err(CircuitError::HandshakeFailed(
+                format!("Circuit ID mismatch: expected {}, got {}", circuit.id, response_cell.circ_id)
+            ));
+        }
+        
+        if response_cell.command != CELL_COMMAND_CREATED2 {
+            return Err(CircuitError::HandshakeFailed(
+                format!("Expected CREATED2 response, got command {}", response_cell.command)
+            ));
         }
 
-        let created2_cell = Created2Cell::from_bytes(response_payload).map_err(|e| CircuitError::HandshakeFailed(e.to_string()))?;
+        let created2_cell = Created2Cell::from_bytes(&response_cell.payload)
+            .map_err(|e| CircuitError::HandshakeFailed(format!("Failed to parse CREATED2 payload: {}", e)))?;
 
-        // 7. Perform key derivation
+        // 9. Perform NTor key derivation
         let (keys, auth) = ntor_handshake(
             client_private_key,
             &client_public_key,
@@ -259,15 +372,15 @@ impl CircuitManager {
             &hop.onion_key,
         )?;
 
-        // 8. Verify the auth value
+        // 10. Verify the auth value
         if auth != created2_cell.auth {
-            return Err(CircuitError::HandshakeFailed("Invalid auth value from relay".to_string()));
+            return Err(CircuitError::HandshakeFailed("Authentication verification failed".to_string()));
         }
 
-        // 9. Update the crypto state for the hop
+        // 11. Update the crypto state for the hop
         hop.crypto_state = OnionCrypto::from_ntor_keys(keys)?;
 
-        log::info!("Handshake with relay {} successful", hop.relay_id);
+        log::info!("✓ Handshake with relay {} successful!", hop.relay_id);
 
         Ok(())
     }
