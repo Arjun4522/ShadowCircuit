@@ -12,7 +12,7 @@ fn setup_logger() {
         .try_init();
 }
 
-async fn get_directory_client() -> &'static Arc<DirectoryClient> {
+    async fn get_directory_client() -> &'static Arc<DirectoryClient> {
     DIRECTORY_CLIENT.get_or_init(|| async {
         let config = TorConfig {
             directory_authorities: vec!["tor-collector".to_string()],
