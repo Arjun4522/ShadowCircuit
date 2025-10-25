@@ -170,10 +170,8 @@ impl Create2Cell {
             return Err(format!("Relay onion key must be 32 bytes, got {}", relay_onion_key.len()));
         }
         
-        let mut handshake_data = Vec::with_capacity(84);
+        let mut handshake_data = Vec::with_capacity(32);
         handshake_data.extend_from_slice(client_public_key.as_bytes());
-        handshake_data.extend_from_slice(relay_identity);
-        handshake_data.extend_from_slice(relay_onion_key);
         
         Ok(Self {
             handshake_type: 2, // ntor

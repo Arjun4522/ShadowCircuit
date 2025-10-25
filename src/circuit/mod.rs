@@ -1,5 +1,6 @@
 // src/circuit/mod.rs - COMPLETE HANDSHAKE WITH CERTS/NETINFO HANDLING
-use crate::crypto::{OnionCrypto, ntor_handshake};
+use crate::crypto::OnionCrypto;
+use crate::crypto::ntor;
 use crate::directory::DirectoryClient;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -447,13 +448,13 @@ impl CircuitManager {
             .map_err(|e| CircuitError::HandshakeFailed(format!("Failed to parse CREATED2 payload: {}", e)))?;
 
         // Perform ntor key derivation
-        let (keys, auth) = ntor_handshake(
+        let (keys, auth) = ntor::ntor_handshake(
             client_private_key,
             &client_public_key,
             &created2_cell.server_public_key,
             &hop.identity_key,
             &hop.onion_key,
-        )?;
+        );
 
         // Verify auth
         if auth != created2_cell.auth {
