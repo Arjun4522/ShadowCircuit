@@ -29,7 +29,7 @@ bytes = "1.0"
 hkdf = "0.12"
 sha2 = "0.10"
 tokio-rustls = "0.24"
-rustls = "0.21"
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
 
 [dev-dependencies]
 mockall = "0.11"
