@@ -7,6 +7,7 @@ use rand_core::OsRng;
 fn test_ntor_handshake() {
     let client_private_key = EphemeralSecret::random_from_rng(OsRng);
     let client_public_key = PublicKey::from(&client_private_key);
+    let client_private_bytes = client_private_key.to_bytes();
 
     let server_private_key = EphemeralSecret::random_from_rng(OsRng);
     let server_public_key = PublicKey::from(&server_private_key);
@@ -15,7 +16,7 @@ fn test_ntor_handshake() {
     let relay_onion_key = [2u8; 32];     // 32 bytes for onion key
 
     let (keys, auth) = ntor_handshake(
-        client_private_key,
+        &client_private_bytes,  // Now passing as bytes reference
         &client_public_key,
         &server_public_key,
         &relay_identity_key,
@@ -121,6 +122,7 @@ fn test_ntor_handshake_deterministic() {
     // Test that the same inputs produce reasonable outputs
     let client_private_key = EphemeralSecret::random_from_rng(OsRng);
     let client_public_key = PublicKey::from(&client_private_key);
+    let client_private_bytes = client_private_key.to_bytes();
 
     let server_private_key = EphemeralSecret::random_from_rng(OsRng);
     let server_public_key = PublicKey::from(&server_private_key);
@@ -129,7 +131,7 @@ fn test_ntor_handshake_deterministic() {
     let relay_onion_key = [2u8; 32];
 
     let (keys1, auth1) = ntor_handshake(
-        client_private_key,
+        &client_private_bytes,
         &client_public_key,
         &server_public_key,
         &relay_identity_key,
@@ -143,4 +145,43 @@ fn test_ntor_handshake_deterministic() {
     
     // Verify forward and backward keys are different
     assert_ne!(keys1.forward_key, keys1.backward_key);
+}
+
+#[test]
+fn test_ntor_key_material_differs() {
+    // Test that different inputs produce different outputs
+    let client1_private = EphemeralSecret::random_from_rng(OsRng);
+    let client1_public = PublicKey::from(&client1_private);
+    let client1_bytes = client1_private.to_bytes();
+
+    let client2_private = EphemeralSecret::random_from_rng(OsRng);
+    let client2_public = PublicKey::from(&client2_private);
+    let client2_bytes = client2_private.to_bytes();
+
+    let server_private = EphemeralSecret::random_from_rng(OsRng);
+    let server_public = PublicKey::from(&server_private);
+
+    let relay_identity = [1u8; 20];
+    let relay_onion = [2u8; 32];
+
+    let (keys1, auth1) = ntor_handshake(
+        &client1_bytes,
+        &client1_public,
+        &server_public,
+        &relay_identity,
+        &relay_onion,
+    );
+
+    let (keys2, auth2) = ntor_handshake(
+        &client2_bytes,
+        &client2_public,
+        &server_public,
+        &relay_identity,
+        &relay_onion,
+    );
+
+    // Different client keys should produce different outputs
+    assert_ne!(keys1.forward_key, keys2.forward_key);
+    assert_ne!(keys1.backward_key, keys2.backward_key);
+    assert_ne!(auth1, auth2);
 }

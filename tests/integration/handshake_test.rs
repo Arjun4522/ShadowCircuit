@@ -7,12 +7,12 @@ static DIRECTORY_CLIENT: OnceCell<Arc<DirectoryClient>> = OnceCell::const_new();
 
 fn setup_logger() {
     let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Info)
+        .filter_level(log::LevelFilter::Debug)  // Changed to Debug for detailed output
         .is_test(true)
         .try_init();
 }
 
-    async fn get_directory_client() -> &'static Arc<DirectoryClient> {
+async fn get_directory_client() -> &'static Arc<DirectoryClient> {
     DIRECTORY_CLIENT.get_or_init(|| async {
         let config = TorConfig {
             directory_authorities: vec!["tor-collector".to_string()],
@@ -25,7 +25,9 @@ fn setup_logger() {
 #[tokio::test]
 async fn test_single_hop_handshake() {
     setup_logger();
-    log::info!("=== Starting Single Hop Handshake Test ===");
+    log::info!("╔═══════════════════════════════════════════════════════════╗");
+    log::info!("║      Starting Single Hop Handshake Test                  ║");
+    log::info!("╚═══════════════════════════════════════════════════════════╝");
     
     let directory_client = get_directory_client().await;
     let circuit_manager = Arc::new(CircuitManager::new());
@@ -34,25 +36,32 @@ async fn test_single_hop_handshake() {
     let result = circuit_manager.create_circuit(1, directory_client).await;
     
     if let Err(e) = &result {
-        log::error!("Error creating circuit: {:?}", e);
+        log::error!("╔═══════════════════════════════════════════════════════════╗");
+        log::error!("║           CIRCUIT CREATION FAILED                         ║");
+        log::error!("╚═══════════════════════════════════════════════════════════╝");
+        log::error!("Error: {:?}", e);
         panic!("Circuit creation failed: {:?}", e);
     }
     
     let circuit_id = result.unwrap();
-    log::info!("Circuit {} created", circuit_id);
+    log::info!("✓ Circuit {} created", circuit_id);
     
     let state = circuit_manager.get_circuit_state(circuit_id).await;
-    log::info!("Circuit state: {:?}", state);
+    log::info!("✓ Circuit state: {:?}", state);
     
     assert_eq!(state, Some(CircuitState::Ready), "Circuit should be in Ready state");
     
-    log::info!("=== Test Passed ===");
+    log::info!("╔═══════════════════════════════════════════════════════════╗");
+    log::info!("║              TEST PASSED                                  ║");
+    log::info!("╚═══════════════════════════════════════════════════════════╝");
 }
 
 #[tokio::test]
 async fn test_three_hop_circuit() {
     setup_logger();
-    log::info!("=== Starting Three Hop Circuit Test ===");
+    log::info!("╔═══════════════════════════════════════════════════════════╗");
+    log::info!("║      Starting Three Hop Circuit Test                     ║");
+    log::info!("╚═══════════════════════════════════════════════════════════╝");
     
     let directory_client = get_directory_client().await;
     let circuit_manager = Arc::new(CircuitManager::new());
@@ -64,25 +73,32 @@ async fn test_three_hop_circuit() {
     let result = circuit_manager.create_circuit(1, directory_client).await;
     
     if let Err(e) = &result {
-        log::error!("Error creating circuit: {:?}", e);
+        log::error!("╔═══════════════════════════════════════════════════════════╗");
+        log::error!("║           CIRCUIT CREATION FAILED                         ║");
+        log::error!("╚═══════════════════════════════════════════════════════════╝");
+        log::error!("Error: {:?}", e);
         panic!("Circuit creation failed: {:?}", e);
     }
     
     let circuit_id = result.unwrap();
-    log::info!("Circuit {} created", circuit_id);
+    log::info!("✓ Circuit {} created", circuit_id);
     
     let state = circuit_manager.get_circuit_state(circuit_id).await;
-    log::info!("Circuit state: {:?}", state);
+    log::info!("✓ Circuit state: {:?}", state);
     
     assert_eq!(state, Some(CircuitState::Ready), "Circuit should be in Ready state");
     
-    log::info!("=== Test Passed ===");
+    log::info!("╔═══════════════════════════════════════════════════════════╗");
+    log::info!("║              TEST PASSED                                  ║");
+    log::info!("╚═══════════════════════════════════════════════════════════╝");
 }
 
 #[tokio::test]
 async fn test_multiple_circuits() {
     setup_logger();
-    log::info!("=== Starting Multiple Circuits Test ===");
+    log::info!("╔═══════════════════════════════════════════════════════════╗");
+    log::info!("║      Starting Multiple Circuits Test                     ║");
+    log::info!("╚═══════════════════════════════════════════════════════════╝");
     
     let directory_client = get_directory_client().await;
     let circuit_manager = Arc::new(CircuitManager::new());
@@ -90,22 +106,29 @@ async fn test_multiple_circuits() {
     let num_circuits = 3;
     
     for i in 0..num_circuits {
+        log::info!("───────────────────────────────────────────────────────────");
         log::info!("Creating circuit {} of {}", i + 1, num_circuits);
+        log::info!("───────────────────────────────────────────────────────────");
         
         let result = circuit_manager.create_circuit(1, directory_client).await;
         
         match result {
             Ok(circuit_id) => {
-                log::info!("Circuit {} created successfully", circuit_id);
+                log::info!("✓ Circuit {} created successfully", circuit_id);
                 let state = circuit_manager.get_circuit_state(circuit_id).await;
                 assert_eq!(state, Some(CircuitState::Ready));
             }
             Err(e) => {
-                log::error!("Circuit {} failed: {:?}", i + 1, e);
+                log::error!("╔═══════════════════════════════════════════════════════════╗");
+                log::error!("║      CIRCUIT {} FAILED                                   ║", i + 1);
+                log::error!("╚═══════════════════════════════════════════════════════════╝");
+                log::error!("Error: {:?}", e);
                 panic!("Circuit creation failed");
             }
         }
     }
     
-    log::info!("=== All {} Circuits Created Successfully ===", num_circuits);
+    log::info!("╔═══════════════════════════════════════════════════════════╗");
+    log::info!("║   All {} Circuits Created Successfully                   ║", num_circuits);
+    log::info!("╚═══════════════════════════════════════════════════════════╝");
 }
