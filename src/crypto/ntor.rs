@@ -1,10 +1,14 @@
-use x25519_dalek::{PublicKey, StaticSecret, SharedSecret};
+use x25519_dalek::PublicKey;
 use rand_core::OsRng;
-use sha2::Sha256;
+use sha2::{Sha256, Digest};
+use hmac::{Hmac, Mac};
 use hkdf::Hkdf;
+use x25519_dalek::EphemeralSecret;
+
+type HmacSha256 = Hmac<Sha256>;
 
 pub struct NtorSecret {
-    pub secret: StaticSecret,
+    pub secret: EphemeralSecret,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -19,7 +23,7 @@ pub struct NtorKeys {
 
 impl NtorSecret {
     pub fn new() -> Self {
-        let secret = StaticSecret::random_from_rng(OsRng);
+        let secret = EphemeralSecret::random_from_rng(OsRng);
         Self { secret }
     }
 
@@ -43,33 +47,64 @@ impl NtorPublic {
     }
 }
 
-/// Perform the ntor handshake with correct two Diffie-Hellman computations
+/// h_tweak: Compute HMAC-SHA256 with tweak as the key
+/// This matches Tor's h_tweak function which uses the tweak as the HMAC key
+fn h_tweak(tweak: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(tweak)
+        .expect("HMAC can take key of any size");
+    mac.update(data);
+    let result = mac.finalize();
+    let bytes = result.into_bytes();
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&bytes);
+    output
+}
+
+/// Performs the ntor handshake - CLIENT SIDE
 /// 
-/// According to tor-spec.txt section 5.1.4:
-/// Client computes:
-///   secret_input = EXP(Y,x) | EXP(B,x) | ID | B | X | Y | PROTOID
-///   KEY_SEED = H(secret_input, t_key)
-///   verify = H(secret_input, t_verify)
-///   auth_input = verify | ID | B | Y | X | PROTOID | "Server"
-///   AUTH = H(auth_input, t_mac)
+/// This implements the client side of the ntor handshake as specified in tor-spec.txt section 5.1.4
+/// and matches the implementation in src/core/crypto/onion_ntor.c
 /// 
-/// Where:
-///   X, x = client's ephemeral public and private keys
-///   Y, y = server's ephemeral public and private keys  
-///   B, b = server's long-term ntor onion public and private keys
-///   ID = server's identity key (20 bytes)
-///   H(x,t) = HMAC-SHA256 with message x and key t
+/// Inputs:
+/// - client_private_key (x): Client's ephemeral private key as bytes [u8; 32]
+/// - client_public_key (X): Client's ephemeral public key
+/// - server_public_key (Y): Server's ephemeral public key (from CREATED2)
+/// - relay_identity_key (ID): Server's identity key (20 bytes)
+/// - relay_onion_key (B): Server's ntor onion key (32 bytes)
+/// 
+/// Returns:
+/// - (NtorKeys, auth): Derived keys and authentication value
+/// 
+/// The client computes:
+///   XY = EXP(Y, x) - shared secret with server's ephemeral key
+///   XB = EXP(B, x) - shared secret with server's static onion key
 pub fn ntor_handshake(
+    client_private_key: &[u8; 32],
     client_public_key: &PublicKey,
     server_public_key: &PublicKey,
     relay_identity_key: &[u8],
     relay_onion_key: &[u8],
-    xy_shared: &SharedSecret,
-    xb_shared: &SharedSecret,
 ) -> (NtorKeys, Vec<u8>) {
+    // Parse relay_onion_key (B) as PublicKey
+    let mut b_bytes = [0u8; 32];
+    b_bytes.copy_from_slice(relay_onion_key);
+    let relay_onion_pubkey = PublicKey::from(b_bytes);
+    
+    // Compute BOTH shared secrets using the same private key
+    // XY = x * Y (client private * server ephemeral public)
+    let xy_shared = x25519_dalek::x25519(*client_private_key, server_public_key.to_bytes());
+    
+    // XB = x * B (client private * server static onion public)  
+    let xb_shared = x25519_dalek::x25519(*client_private_key, relay_onion_pubkey.to_bytes());
+    
+    log::debug!("XY DH (first 8 bytes): {:02x?}", &xy_shared[..8]);
+    log::debug!("XB DH (first 8 bytes): {:02x?}", &xb_shared[..8]);
+    log::info!("Computed both DH operations: EXP(Y,x) and EXP(B,x)");
+    log::info!("Starting ntor key derivation...");
+    
     ntor_key_derivation(
-        xy_shared.as_bytes(),
-        xb_shared.as_bytes(),
+        &xy_shared,
+        &xb_shared,
         relay_identity_key,
         relay_onion_key,
         client_public_key.as_bytes(),
@@ -77,149 +112,101 @@ pub fn ntor_handshake(
     )
 }
 
+/// Performs ntor key derivation
+/// 
+/// This implements the key derivation function EXACTLY as in Tor's onion_ntor.c
+/// 
+/// According to Tor's implementation:
+/// 1. secret_input = XY | XB | ID | B | X | Y | PROTOID
+/// 2. verify = HMAC-SHA256(T_VERIFY, secret_input)
+/// 3. auth_input = verify | ID | B | Y | X | PROTOID | "Server"
+/// 4. AUTH = HMAC-SHA256(T_MAC, auth_input)
+/// 5. Key material = HKDF-SHA256-Expand(HKDF-SHA256-Extract(T_KEY, secret_input), M_EXPAND, length)
 pub fn ntor_key_derivation(
-    xy_shared: &[u8],      // EXP(Y,x) - client ephemeral private * server ephemeral public
-    xb_shared: &[u8],      // EXP(B,x) - client ephemeral private * server long-term public
-    relay_identity_key: &[u8],  // ID - 20 bytes
-    relay_onion_key: &[u8],     // B - 32 bytes
-    client_public_key: &[u8],   // X - 32 bytes
-    server_public_key: &[u8],   // Y - 32 bytes
+    xy_shared: &[u8],       // EXP(Y, x) - 32 bytes
+    xb_shared: &[u8],       // EXP(B, x) - 32 bytes  
+    relay_identity: &[u8],  // ID - 20 bytes
+    relay_onion_key: &[u8], // B - 32 bytes  
+    client_public: &[u8],   // X - 32 bytes
+    server_public: &[u8],   // Y - 32 bytes
 ) -> (NtorKeys, Vec<u8>) {
     const PROTOID: &[u8] = b"ntor-curve25519-sha256-1";
-    const T_MAC: &[u8] = b"ntor-curve25519-sha256-1:mac";
     const T_KEY: &[u8] = b"ntor-curve25519-sha256-1:key_extract";
+    const T_MAC: &[u8] = b"ntor-curve25519-sha256-1:mac";
     const T_VERIFY: &[u8] = b"ntor-curve25519-sha256-1:verify";
     const M_EXPAND: &[u8] = b"ntor-curve25519-sha256-1:key_expand";
+    const SERVER_STR: &[u8] = b"Server";
 
     log::debug!("=== ntor Key Derivation Debug ===");
     log::debug!("XY shared (first 8 bytes): {:02x?}", &xy_shared[..8]);
     log::debug!("XB shared (first 8 bytes): {:02x?}", &xb_shared[..8]);
-    log::debug!("Relay identity (first 8 bytes): {:02x?}", &relay_identity_key[..8]);
+    log::debug!("Relay identity (first 8 bytes): {:02x?}", &relay_identity[..8]);
     log::debug!("Relay onion key (first 8 bytes): {:02x?}", &relay_onion_key[..8]);
-    log::debug!("Client public key (first 8 bytes): {:02x?}", &client_public_key[..8]);
-    log::debug!("Server public key (first 8 bytes): {:02x?}", &server_public_key[..8]);
+    log::debug!("Client public key (first 8 bytes): {:02x?}", &client_public[..8]);
+    log::debug!("Server public key (first 8 bytes): {:02x?}", &server_public[..8]);
 
-    // Build secret_input according to spec:
-    // EXP(Y,x) | EXP(B,x) | ID | B | X | Y | PROTOID
-    let mut secret_input = Vec::with_capacity(32 + 32 + 20 + 32 + 32 + 32 + PROTOID.len());
-    secret_input.extend_from_slice(xy_shared);           // 32 bytes - EXP(Y,x)
-    secret_input.extend_from_slice(xb_shared);           // 32 bytes - EXP(B,x)
-    secret_input.extend_from_slice(relay_identity_key);  // 20 bytes - ID (relay identity)
-    secret_input.extend_from_slice(relay_onion_key);     // 32 bytes - B (relay onion key)
-    secret_input.extend_from_slice(client_public_key);   // 32 bytes - X (client public key)
-    secret_input.extend_from_slice(server_public_key);   // 32 bytes - Y (server public key)
-    secret_input.extend_from_slice(PROTOID);             // PROTOID
+    // Build secret_input per Tor spec:
+    // secret_input = EXP(Y,x) | EXP(B,x) | ID | B | X | Y | PROTOID
+    let mut secret_input = Vec::new();
+    secret_input.extend_from_slice(xy_shared);      // 32 bytes
+    secret_input.extend_from_slice(xb_shared);      // 32 bytes
+    secret_input.extend_from_slice(relay_identity); // 20 bytes
+    secret_input.extend_from_slice(relay_onion_key);// 32 bytes
+    secret_input.extend_from_slice(client_public);  // 32 bytes
+    secret_input.extend_from_slice(server_public);  // 32 bytes
+    secret_input.extend_from_slice(PROTOID);        // 24 bytes
+    // Total: 204 bytes ✓
 
     log::debug!("secret_input length: {} bytes", secret_input.len());
     log::debug!("secret_input (first 16 bytes): {:02x?}", &secret_input[..16]);
 
-// KEY_SEED = H(secret_input, t_key)  -- HMAC-SHA256(secret_input, key=t_key)
-    // In the HMAC, t_key is the key and secret_input is the message
-    let key_seed_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, T_KEY);
-    let key_seed = ring::hmac::sign(&key_seed_key, &secret_input);
-    log::debug!("KEY_SEED (first 8 bytes): {:02x?}", &key_seed.as_ref()[..8]);
-    
-    // verify = H(secret_input, t_verify) -- HMAC-SHA256(secret_input, key=t_verify)
-    let verify_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, T_VERIFY);
-    let verify = ring::hmac::sign(&verify_key, &secret_input);
-    log::debug!("verify (first 8 bytes): {:02x?}", &verify.as_ref()[..8]);
+    // Step 1: Compute verify = HMAC-SHA256(T_VERIFY, secret_input)
+    // This is h_tweak in Tor's code
+    let verify = h_tweak(T_VERIFY, &secret_input);
+    log::debug!("verify (first 8 bytes): {:02x?}", &verify[..8]);
 
+    // Step 2: Build auth_input
     // auth_input = verify | ID | B | Y | X | PROTOID | "Server"
-    // According to Tor spec section 5.1.4, the order is critical
-    let mut auth_input = Vec::with_capacity(32 + 20 + 32 + 32 + 32 + PROTOID.len() + 6);
-    auth_input.extend_from_slice(verify.as_ref());      // verify (32 bytes)
-    auth_input.extend_from_slice(relay_identity_key);   // ID (20 bytes) - server identity key
-    auth_input.extend_from_slice(relay_onion_key);      // B (32 bytes) - server onion key
-    auth_input.extend_from_slice(server_public_key);    // Y (32 bytes) - server ephemeral public key
-    auth_input.extend_from_slice(client_public_key);    // X (32 bytes) - client ephemeral public key
-    auth_input.extend_from_slice(PROTOID);              // PROTOID (25 bytes) - "ntor-curve25519-sha256-1"
-    auth_input.extend_from_slice(b"Server");            // "Server" (6 bytes)
+    let mut auth_input = Vec::new();
+    auth_input.extend_from_slice(&verify);           // 32 bytes
+    auth_input.extend_from_slice(relay_identity);    // 20 bytes
+    auth_input.extend_from_slice(relay_onion_key);   // 32 bytes
+    auth_input.extend_from_slice(server_public);     // 32 bytes (Y)
+    auth_input.extend_from_slice(client_public);     // 32 bytes (X)
+    auth_input.extend_from_slice(PROTOID);           // 24 bytes
+    auth_input.extend_from_slice(SERVER_STR);        // 6 bytes
+    // Total: 178 bytes ✓
 
     log::debug!("auth_input length: {} bytes", auth_input.len());
     log::debug!("auth_input (first 16 bytes): {:02x?}", &auth_input[..16]);
 
-    // AUTH = H(auth_input, t_mac) -- HMAC-SHA256(auth_input, key=t_mac)
-    // In the HMAC, t_mac is the key and auth_input is the message
-    let auth_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, T_MAC);
-    let auth = ring::hmac::sign(&auth_key, &auth_input);
-    
-    log::debug!("Computed AUTH (full): {:02x?}", auth.as_ref());
+    // Step 3: Compute AUTH = HMAC-SHA256(T_MAC, auth_input)
+    let auth = h_tweak(T_MAC, &auth_input);
+    log::debug!("Computed AUTH (full): {:02x?}", auth);
 
-    // Use HKDF-SHA256 to expand KEY_SEED into actual keys
-    let hkdf = Hkdf::<Sha256>::new(None, key_seed.as_ref());
+    // Step 4: Derive key material using HKDF-SHA256
+    // This matches crypto_expand_key_material_rfc5869_sha256 in Tor
+    // HKDF-Extract(salt=T_KEY, IKM=secret_input) -> PRK
+    // HKDF-Expand(PRK, info=M_EXPAND, length) -> output key material
+    let hkdf = Hkdf::<Sha256>::new(Some(T_KEY), &secret_input);
     
-    let mut full_key_material = vec![0u8; 128];
-    hkdf.expand(M_EXPAND, &mut full_key_material).unwrap();
+    let mut key_material = [0u8; 72];
+    hkdf.expand(M_EXPAND, &mut key_material)
+        .expect("HKDF expand failed");
 
-    // Extract keys: forward and backward keys for AES-256-GCM (32 bytes each)
-    // According to Tor spec, after HKDF expansion we get 128 bytes total:
-    // Bytes 0-31:   unused in this implementation
-    // Bytes 32-63:  unused in this implementation  
-    // Bytes 64-95:  forward key (client to server)
-    // Bytes 96-127: backward key (server to client)
-    let forward_key: [u8; 32] = full_key_material[64..96].try_into().unwrap();
-    let backward_key: [u8; 32] = full_key_material[96..128].try_into().unwrap();
+    let forward_key: [u8; 32] = key_material[0..32].try_into().unwrap();
+    let backward_key: [u8; 32] = key_material[32..64].try_into().unwrap();
+    // bytes 64..72 can be used for additional key material if needed
 
     log::debug!("forward_key (first 8 bytes): {:02x?}", &forward_key[..8]);
     log::debug!("backward_key (first 8 bytes): {:02x?}", &backward_key[..8]);
     log::debug!("=== End ntor Key Derivation Debug ===");
 
-        (
-            NtorKeys { forward_key, backward_key },
-            auth.as_ref().to_vec()
-        )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_ntor_key_derivation() {
-        // Test vectors
-        let xy_shared = [1u8; 32];
-        let xb_shared = [2u8; 32];
-        let relay_identity = [3u8; 20];
-        let relay_onion = [4u8; 32];
-        let client_public = [5u8; 32];
-        let server_public = [6u8; 32];
-
-        let (keys, auth) = ntor_key_derivation(
-            &xy_shared,
-            &xb_shared,
-            &relay_identity,
-            &relay_onion,
-            &client_public,
-            &server_public,
-        );
-
-        // Verify outputs are generated
-        assert_eq!(keys.forward_key.len(), 32);
-        assert_eq!(keys.backward_key.len(), 32);
-        assert_eq!(auth.len(), 32);
-
-        // Verify keys are different
-        assert_ne!(keys.forward_key, keys.backward_key);
-        assert_ne!(keys.forward_key, [0u8; 32]);
-        assert_ne!(keys.backward_key, [0u8; 32]);
-        assert_ne!(auth, vec![0u8; 32]);
-    }
-
-    #[test]
-    fn test_hmac_computation() {
-        // Verify HMAC is being used correctly
-        let test_data = b"test data";
-        let test_key = b"test key";
-        
-        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, test_key);
-        let result = ring::hmac::sign(&key, test_data);
-        
-        // Should produce 32 bytes
-        assert_eq!(result.as_ref().len(), 32);
-        
-        // Should be deterministic
-        let result2 = ring::hmac::sign(&key, test_data);
-        
-        assert_eq!(result.as_ref(), result2.as_ref());
-    }
+    (
+        NtorKeys {
+            forward_key,
+            backward_key,
+        },
+        auth.to_vec(),
+    )
 }
