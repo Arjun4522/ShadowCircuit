@@ -240,7 +240,8 @@ impl DirectoryClient {
             return Err(DirectoryError::InvalidConsensus("No relays found".to_string()));
         }
 
-        // Microdescriptors will be fetched on demand in select_relay
+        // Fetch real microdescriptors to get actual Curve25519 onion keys
+        self.fetch_microdescriptors(&mut relays).await?;
 
         Ok(NetworkConsensus {
             valid_after: SystemTime::now(),
@@ -321,7 +322,7 @@ impl DirectoryClient {
 
         *i = j - 1;
 
-        // For now, use derived key; we'll fetch real microdescs later
+        // Start with derived key; will be replaced with real key from microdesc
         let onion_key = self.derive_onion_key_from_identity(&identity_key);
 
         Ok(RelayDescriptor {

@@ -1,14 +1,13 @@
-use x25519_dalek::PublicKey;
+use x25519_dalek::{PublicKey, ReusableSecret};
 use rand_core::OsRng;
-use sha2::{Sha256, Digest};
+use sha2::Sha256;
 use hmac::{Hmac, Mac};
 use hkdf::Hkdf;
-use x25519_dalek::EphemeralSecret;
 
 type HmacSha256 = Hmac<Sha256>;
 
 pub struct NtorSecret {
-    pub secret: EphemeralSecret,
+    pub secret: ReusableSecret,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -23,7 +22,7 @@ pub struct NtorKeys {
 
 impl NtorSecret {
     pub fn new() -> Self {
-        let secret = EphemeralSecret::random_from_rng(OsRng);
+        let secret = ReusableSecret::random_from_rng(OsRng);
         Self { secret }
     }
 
@@ -48,7 +47,7 @@ impl NtorPublic {
 }
 
 /// h_tweak: Compute HMAC-SHA256 with tweak as the key
-/// This matches Tor's h_tweak function which uses the tweak as the HMAC key
+/// This matches Tor's h_tweak function
 fn h_tweak(tweak: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(tweak)
         .expect("HMAC can take key of any size");
@@ -62,24 +61,16 @@ fn h_tweak(tweak: &[u8], data: &[u8]) -> [u8; 32] {
 
 /// Performs the ntor handshake - CLIENT SIDE
 /// 
-/// This implements the client side of the ntor handshake as specified in tor-spec.txt section 5.1.4
-/// and matches the implementation in src/core/crypto/onion_ntor.c
+/// This matches the official Tor implementation in onion_ntor.c
+/// See: onion_skin_ntor_client_handshake()
 /// 
-/// Inputs:
-/// - client_private_key (x): Client's ephemeral private key as bytes [u8; 32]
-/// - client_public_key (X): Client's ephemeral public key
-/// - server_public_key (Y): Server's ephemeral public key (from CREATED2)
-/// - relay_identity_key (ID): Server's identity key (20 bytes)
-/// - relay_onion_key (B): Server's ntor onion key (32 bytes)
+/// Key insight: The client uses the SAME private key x for TWO DH operations:
+/// - XY = x * Y (with server's ephemeral public key)
+/// - XB = x * B (with server's static onion key)
 /// 
-/// Returns:
-/// - (NtorKeys, auth): Derived keys and authentication value
-/// 
-/// The client computes:
-///   XY = EXP(Y, x) - shared secret with server's ephemeral key
-///   XB = EXP(B, x) - shared secret with server's static onion key
+/// This is why we use StaticSecret instead of EphemeralSecret!
 pub fn ntor_handshake(
-    client_private_key: &[u8; 32],
+    client_private_key: &ReusableSecret,
     client_public_key: &PublicKey,
     server_public_key: &PublicKey,
     relay_identity_key: &[u8],
@@ -90,21 +81,24 @@ pub fn ntor_handshake(
     b_bytes.copy_from_slice(relay_onion_key);
     let relay_onion_pubkey = PublicKey::from(b_bytes);
     
-    // Compute BOTH shared secrets using the same private key
+    // CRITICAL: Compute BOTH shared secrets using the SAME private key
+    // This matches the official Tor implementation exactly:
+    //   curve25519_handshake(si, &handshake_state->seckey_x, &s.pubkey_Y);
+    //   curve25519_handshake(si, &handshake_state->seckey_x, &handshake_state->pubkey_B);
+    
     // XY = x * Y (client private * server ephemeral public)
-    let xy_shared = x25519_dalek::x25519(*client_private_key, server_public_key.to_bytes());
+    let xy_shared = client_private_key.diffie_hellman(server_public_key);
     
     // XB = x * B (client private * server static onion public)  
-    let xb_shared = x25519_dalek::x25519(*client_private_key, relay_onion_pubkey.to_bytes());
+    let xb_shared = client_private_key.diffie_hellman(&relay_onion_pubkey);
     
-    log::debug!("XY DH (first 8 bytes): {:02x?}", &xy_shared[..8]);
-    log::debug!("XB DH (first 8 bytes): {:02x?}", &xb_shared[..8]);
+    log::debug!("XY DH (first 8 bytes): {:02x?}", &xy_shared.as_bytes()[..8]);
+    log::debug!("XB DH (first 8 bytes): {:02x?}", &xb_shared.as_bytes()[..8]);
     log::info!("Computed both DH operations: EXP(Y,x) and EXP(B,x)");
-    log::info!("Starting ntor key derivation...");
     
     ntor_key_derivation(
-        &xy_shared,
-        &xb_shared,
+        xy_shared.as_bytes(),
+        xb_shared.as_bytes(),
         relay_identity_key,
         relay_onion_key,
         client_public_key.as_bytes(),
@@ -114,15 +108,13 @@ pub fn ntor_handshake(
 
 /// Performs ntor key derivation
 /// 
-/// This implements the key derivation function EXACTLY as in Tor's onion_ntor.c
-/// 
-/// According to Tor's implementation:
-/// 1. secret_input = XY | XB | ID | B | X | Y | PROTOID
-/// 2. verify = HMAC-SHA256(T_VERIFY, secret_input)
-/// 3. auth_input = verify | ID | B | Y | X | PROTOID | "Server"
-/// 4. AUTH = HMAC-SHA256(T_MAC, auth_input)
-/// 5. Key material = HKDF-SHA256-Expand(HKDF-SHA256-Extract(T_KEY, secret_input), M_EXPAND, length)
-pub fn ntor_key_derivation(
+/// This matches the official Tor implementation exactly:
+/// 1. Build secret_input = XY | XB | ID | B | X | Y | PROTOID (204 bytes)
+/// 2. Compute verify = h_tweak(T_VERIFY, secret_input)
+/// 3. Build auth_input = verify | ID | B | Y | X | PROTOID | "Server" (178 bytes)
+/// 4. Compute AUTH = h_tweak(T_MAC, auth_input)
+/// 5. Derive keys using HKDF-SHA256
+fn ntor_key_derivation(
     xy_shared: &[u8],       // EXP(Y, x) - 32 bytes
     xb_shared: &[u8],       // EXP(B, x) - 32 bytes  
     relay_identity: &[u8],  // ID - 20 bytes
@@ -137,55 +129,52 @@ pub fn ntor_key_derivation(
     const M_EXPAND: &[u8] = b"ntor-curve25519-sha256-1:key_expand";
     const SERVER_STR: &[u8] = b"Server";
 
-    log::debug!("=== ntor Key Derivation Debug ===");
+    log::debug!("=== ntor Key Derivation (matches Tor onion_ntor.c) ===");
     log::debug!("XY shared (first 8 bytes): {:02x?}", &xy_shared[..8]);
     log::debug!("XB shared (first 8 bytes): {:02x?}", &xb_shared[..8]);
-    log::debug!("Relay identity (first 8 bytes): {:02x?}", &relay_identity[..8]);
-    log::debug!("Relay onion key (first 8 bytes): {:02x?}", &relay_onion_key[..8]);
-    log::debug!("Client public key (first 8 bytes): {:02x?}", &client_public[..8]);
-    log::debug!("Server public key (first 8 bytes): {:02x?}", &server_public[..8]);
 
-    // Build secret_input per Tor spec:
+    // Build secret_input per official Tor spec (SECRET_INPUT_LEN = 204):
     // secret_input = EXP(Y,x) | EXP(B,x) | ID | B | X | Y | PROTOID
     let mut secret_input = Vec::new();
-    secret_input.extend_from_slice(xy_shared);      // 32 bytes
-    secret_input.extend_from_slice(xb_shared);      // 32 bytes
-    secret_input.extend_from_slice(relay_identity); // 20 bytes
-    secret_input.extend_from_slice(relay_onion_key);// 32 bytes
-    secret_input.extend_from_slice(client_public);  // 32 bytes
-    secret_input.extend_from_slice(server_public);  // 32 bytes
-    secret_input.extend_from_slice(PROTOID);        // 24 bytes
+    secret_input.extend_from_slice(xy_shared);      // 32 bytes - XY
+    secret_input.extend_from_slice(xb_shared);      // 32 bytes - XB
+    secret_input.extend_from_slice(relay_identity); // 20 bytes - ID
+    secret_input.extend_from_slice(relay_onion_key);// 32 bytes - B
+    secret_input.extend_from_slice(client_public);  // 32 bytes - X
+    secret_input.extend_from_slice(server_public);  // 32 bytes - Y
+    secret_input.extend_from_slice(PROTOID);        // 24 bytes - PROTOID
     // Total: 204 bytes ✓
 
-    log::debug!("secret_input length: {} bytes", secret_input.len());
-    log::debug!("secret_input (first 16 bytes): {:02x?}", &secret_input[..16]);
+    log::debug!("secret_input length: {} bytes (expected 204)", secret_input.len());
+    assert_eq!(secret_input.len(), 204, "secret_input must be 204 bytes");
 
     // Step 1: Compute verify = HMAC-SHA256(T_VERIFY, secret_input)
-    // This is h_tweak in Tor's code
+    // Matches: h_tweak(s.verify, s.secret_input, sizeof(s.secret_input), T->t_verify);
     let verify = h_tweak(T_VERIFY, &secret_input);
     log::debug!("verify (first 8 bytes): {:02x?}", &verify[..8]);
 
-    // Step 2: Build auth_input
+    // Step 2: Build auth_input per official Tor spec (AUTH_INPUT_LEN = 178):
     // auth_input = verify | ID | B | Y | X | PROTOID | "Server"
     let mut auth_input = Vec::new();
-    auth_input.extend_from_slice(&verify);           // 32 bytes
-    auth_input.extend_from_slice(relay_identity);    // 20 bytes
-    auth_input.extend_from_slice(relay_onion_key);   // 32 bytes
-    auth_input.extend_from_slice(server_public);     // 32 bytes (Y)
-    auth_input.extend_from_slice(client_public);     // 32 bytes (X)
-    auth_input.extend_from_slice(PROTOID);           // 24 bytes
-    auth_input.extend_from_slice(SERVER_STR);        // 6 bytes
+    auth_input.extend_from_slice(&verify);           // 32 bytes - verify
+    auth_input.extend_from_slice(relay_identity);    // 20 bytes - ID
+    auth_input.extend_from_slice(relay_onion_key);   // 32 bytes - B
+    auth_input.extend_from_slice(server_public);     // 32 bytes - Y
+    auth_input.extend_from_slice(client_public);     // 32 bytes - X
+    auth_input.extend_from_slice(PROTOID);           // 24 bytes - PROTOID
+    auth_input.extend_from_slice(SERVER_STR);        // 6 bytes - "Server"
     // Total: 178 bytes ✓
 
-    log::debug!("auth_input length: {} bytes", auth_input.len());
-    log::debug!("auth_input (first 16 bytes): {:02x?}", &auth_input[..16]);
+    log::debug!("auth_input length: {} bytes (expected 178)", auth_input.len());
+    assert_eq!(auth_input.len(), 178, "auth_input must be 178 bytes");
 
     // Step 3: Compute AUTH = HMAC-SHA256(T_MAC, auth_input)
+    // Matches: h_tweak(s.auth, s.auth_input, sizeof(s.auth_input), T->t_mac);
     let auth = h_tweak(T_MAC, &auth_input);
     log::debug!("Computed AUTH (full): {:02x?}", auth);
 
     // Step 4: Derive key material using HKDF-SHA256
-    // This matches crypto_expand_key_material_rfc5869_sha256 in Tor
+    // Matches: crypto_expand_key_material_rfc5869_sha256(...)
     // HKDF-Extract(salt=T_KEY, IKM=secret_input) -> PRK
     // HKDF-Expand(PRK, info=M_EXPAND, length) -> output key material
     let hkdf = Hkdf::<Sha256>::new(Some(T_KEY), &secret_input);
@@ -196,11 +185,11 @@ pub fn ntor_key_derivation(
 
     let forward_key: [u8; 32] = key_material[0..32].try_into().unwrap();
     let backward_key: [u8; 32] = key_material[32..64].try_into().unwrap();
-    // bytes 64..72 can be used for additional key material if needed
+    // bytes 64..72 available for additional key material if needed
 
     log::debug!("forward_key (first 8 bytes): {:02x?}", &forward_key[..8]);
     log::debug!("backward_key (first 8 bytes): {:02x?}", &backward_key[..8]);
-    log::debug!("=== End ntor Key Derivation Debug ===");
+    log::debug!("=== End ntor Key Derivation ===");
 
     (
         NtorKeys {

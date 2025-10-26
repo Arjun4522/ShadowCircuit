@@ -1,13 +1,12 @@
 use tor_client::crypto::ntor::ntor_handshake;
 use tor_client::network::cells::{Create2Cell, Created2Cell};
-use x25519_dalek::{EphemeralSecret, PublicKey};
+use x25519_dalek::{ReusableSecret, PublicKey};
 use rand_core::OsRng;
 
 #[test]
 fn test_ntor_handshake() {
-    let client_private_key = EphemeralSecret::random_from_rng(OsRng);
+    let client_private_key = ReusableSecret::random_from_rng(OsRng);
     let client_public_key = PublicKey::from(&client_private_key);
-    let client_private_bytes = client_private_key.to_bytes();
 
     let server_private_key = EphemeralSecret::random_from_rng(OsRng);
     let server_public_key = PublicKey::from(&server_private_key);
@@ -16,7 +15,7 @@ fn test_ntor_handshake() {
     let relay_onion_key = [2u8; 32];     // 32 bytes for onion key
 
     let (keys, auth) = ntor_handshake(
-        &client_private_bytes,  // Now passing as bytes reference
+        &client_private_key,  // Pass EphemeralSecret reference
         &client_public_key,
         &server_public_key,
         &relay_identity_key,
@@ -31,7 +30,7 @@ fn test_ntor_handshake() {
 
 #[test]
 fn test_create2_cell_to_bytes() {
-    let client_private_key = EphemeralSecret::random_from_rng(OsRng);
+    let client_private_key = ReusableSecret::random_from_rng(OsRng);
     let client_public_key = PublicKey::from(&client_private_key);
     
     let relay_identity = [1u8; 20];
@@ -87,7 +86,7 @@ fn test_created2_cell_from_bytes() {
 
 #[test]
 fn test_create2_cell_validation() {
-    let client_private_key = EphemeralSecret::random_from_rng(OsRng);
+    let client_private_key = ReusableSecret::random_from_rng(OsRng);
     let client_public_key = PublicKey::from(&client_private_key);
     
     // Test with wrong identity length
@@ -119,10 +118,9 @@ fn test_create2_cell_validation() {
 
 #[test]
 fn test_ntor_handshake_deterministic() {
-    // Test that the same inputs produce reasonable outputs
-    let client_private_key = EphemeralSecret::random_from_rng(OsRng);
+    // Test that handshake produces reasonable outputs
+    let client_private_key = ReusableSecret::random_from_rng(OsRng);
     let client_public_key = PublicKey::from(&client_private_key);
-    let client_private_bytes = client_private_key.to_bytes();
 
     let server_private_key = EphemeralSecret::random_from_rng(OsRng);
     let server_public_key = PublicKey::from(&server_private_key);
@@ -131,7 +129,7 @@ fn test_ntor_handshake_deterministic() {
     let relay_onion_key = [2u8; 32];
 
     let (keys1, auth1) = ntor_handshake(
-        &client_private_bytes,
+        &client_private_key,
         &client_public_key,
         &server_public_key,
         &relay_identity_key,
@@ -152,11 +150,9 @@ fn test_ntor_key_material_differs() {
     // Test that different inputs produce different outputs
     let client1_private = EphemeralSecret::random_from_rng(OsRng);
     let client1_public = PublicKey::from(&client1_private);
-    let client1_bytes = client1_private.to_bytes();
 
     let client2_private = EphemeralSecret::random_from_rng(OsRng);
     let client2_public = PublicKey::from(&client2_private);
-    let client2_bytes = client2_private.to_bytes();
 
     let server_private = EphemeralSecret::random_from_rng(OsRng);
     let server_public = PublicKey::from(&server_private);
@@ -165,7 +161,7 @@ fn test_ntor_key_material_differs() {
     let relay_onion = [2u8; 32];
 
     let (keys1, auth1) = ntor_handshake(
-        &client1_bytes,
+        &client1_private,
         &client1_public,
         &server_public,
         &relay_identity,
@@ -173,7 +169,7 @@ fn test_ntor_key_material_differs() {
     );
 
     let (keys2, auth2) = ntor_handshake(
-        &client2_bytes,
+        &client2_private,
         &client2_public,
         &server_public,
         &relay_identity,

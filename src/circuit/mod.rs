@@ -1,4 +1,4 @@
-// src/circuit/mod.rs - COMPLETE HANDSHAKE WITH FIXED NTOR
+// src/circuit/mod.rs - FINAL FIX: Use ReusableSecret
 use crate::crypto::OnionCrypto;
 use crate::crypto::ntor;
 use crate::directory::DirectoryClient;
@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use tokio::sync::RwLock;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
-use x25519_dalek::{EphemeralSecret, PublicKey};
+use x25519_dalek::{EphemeralSecret, PublicKey, ReusableSecret};
 use crate::network::cells::{Cell, Create2Cell, Created2Cell, VersionsCell, 
     CELL_COMMAND_CREATE2, CELL_COMMAND_CREATED2, CELL_COMMAND_VERSIONS, 
     CELL_COMMAND_NETINFO, CELL_LEN};
@@ -99,7 +99,6 @@ impl CircuitManager {
     pub fn new() -> Self {
         Self {
             circuits: RwLock::new(HashMap::new()),
-            // CRITICAL FIX: Start at 0x80000001 (MSB=1 for client-initiated, odd for client)
             next_circuit_id: RwLock::new(0x80000001),
         }
     }
@@ -117,21 +116,16 @@ impl CircuitManager {
             let mut next_id = self.next_circuit_id.write().await;
             let mut id = *next_id;
             
-            // CRITICAL: In link protocol 4+, the node that initiated the connection
-            // (the client) MUST set MSB to 1. CircID must be >= 0x80000000
             if id < 0x80000000 {
                 id = 0x80000001;
             }
             
-            // Ensure CircID is odd (clients use odd, relays use even)
             if id % 2 == 0 {
                 id += 1;
             }
             
-            // Store next ID (increment by 2 to stay odd)
             *next_id = id + 2;
             
-            // Wrap around but stay in MSB=1 range
             if *next_id >= 0xFFFFFFFF {
                 *next_id = 0x80000001;
             }
@@ -200,18 +194,9 @@ impl CircuitManager {
         
         let hop = &mut circuit.hops[0];
         
-        // Generate client keypair - FIX: Use the correct approach for x25519-dalek
-        let client_private_key = EphemeralSecret::random_from_rng(OsRng);
+        // Generate client keypair - USE ReusableSecret (allows multiple DH operations)
+        let client_private_key = ReusableSecret::random_from_rng(OsRng);
         let client_public_key = PublicKey::from(&client_private_key);
-        
-        // FIX: Convert EphemeralSecret to bytes using the correct method
-        // EphemeralSecret doesn't expose to_bytes(), so we need to extract the scalar
-        let client_private_bytes: [u8; 32] = {
-            // This is a workaround - in real usage, we should refactor ntor_handshake
-            // to work with EphemeralSecret directly, but for now we'll use this approach
-            let scalar_bytes = client_private_key.to_bytes();
-            scalar_bytes
-        };
 
         // Connect to relay
         let addr: SocketAddr = hop.ip;
@@ -258,8 +243,8 @@ impl CircuitManager {
         stream.flush().await.map_err(|e| CircuitError::Io(format!("Flush failed: {}", e)))?;
         log::info!("Sent VERSIONS cell");
 
-        // Read VERSIONS response (VERSIONS uses 2-byte circ_id pre-negotiation)
-        let header_size = 5; // 2 (circ_id) + 1 (cmd) + 2 (len)
+        // Read VERSIONS response
+        let header_size = 5;
         let mut header = vec![0u8; header_size];
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -404,7 +389,7 @@ impl CircuitManager {
             }
         }
         
-        // Now send CREATE2 with the CORRECT circuit ID
+        // Now send CREATE2
         let create2_payload = Create2Cell::new(
             &client_public_key,
             &hop.identity_key,
@@ -412,7 +397,7 @@ impl CircuitManager {
         ).map_err(|e| CircuitError::HandshakeFailed(format!("Failed to create CREATE2 cell: {}", e)))?;
         
         let create2_cell = Cell {
-            circ_id: circuit.id, // This is now >= 0x80000000 with MSB=1!
+            circ_id: circuit.id,
             command: CELL_COMMAND_CREATE2,
             payload: create2_payload.to_bytes(),
         };
@@ -465,15 +450,10 @@ impl CircuitManager {
             .map_err(|e| CircuitError::HandshakeFailed(format!("Failed to parse CREATED2 payload: {}", e)))?;
 
         log::info!("=== Starting ntor Handshake Verification ===");
-        log::info!("Client public key (X): {:02x?}...", &client_public_key.as_bytes()[..8]);
-        log::info!("Server public key (Y): {:02x?}...", &created2_cell.server_public_key.as_bytes()[..8]);
-        log::info!("Relay identity (ID): {:02x?}...", &hop.identity_key[..8]);
-        log::info!("Relay onion key (B): {:02x?}...", &hop.onion_key[..8]);
-        log::info!("Received AUTH from server: {:02x?}", created2_cell.auth);
 
-        // Perform ntor key derivation - USING THE FIXED FUNCTION WITH BOTH XY AND XB
+        // Perform ntor key derivation - pass ReusableSecret reference
         let (keys, auth) = ntor::ntor_handshake(
-            &client_private_bytes,  // Pass as bytes reference so it can be used twice!
+            &client_private_key,
             &client_public_key,
             &created2_cell.server_public_key,
             &hop.identity_key,
@@ -481,39 +461,8 @@ impl CircuitManager {
         );
 
         // Verify auth
-        log::info!("Comparing AUTH values:");
-        log::info!("  Computed AUTH: {:02x?}", auth);
-        log::info!("  Received AUTH: {:02x?}", created2_cell.auth);
-
         if auth != created2_cell.auth {
-            log::error!("╔═══════════════════════════════════════════════════════════╗");
-            log::error!("║           AUTH VERIFICATION FAILED!                       ║");
-            log::error!("╚═══════════════════════════════════════════════════════════╝");
-            log::error!("");
-            log::error!("Computed AUTH: {:02x?}", auth);
-            log::error!("Received AUTH: {:02x?}", created2_cell.auth);
-            log::error!("");
-            log::error!("AUTH mismatch details:");
-            log::error!("  Length - Computed: {}, Received: {}", auth.len(), created2_cell.auth.len());
-            
-            // Find first difference
-            for (i, (c, r)) in auth.iter().zip(created2_cell.auth.iter()).enumerate() {
-                if c != r {
-                    log::error!("  First difference at byte {}: computed=0x{:02x}, received=0x{:02x}", i, c, r);
-                    break;
-                }
-            }
-            log::error!("");
-            log::error!("Key material (first 8 bytes each):");
-            log::error!("  Forward key:  {:02x?}", &keys.forward_key[..8]);
-            log::error!("  Backward key: {:02x?}", &keys.backward_key[..8]);
-            log::error!("");
-            log::error!("Input parameters:");
-            log::error!("  Client pubkey (X):  {:02x?}...", &client_public_key.as_bytes()[..8]);
-            log::error!("  Server pubkey (Y):  {:02x?}...", &created2_cell.server_public_key.as_bytes()[..8]);
-            log::error!("  Relay identity (ID): {:02x?}...", &hop.identity_key[..8]);
-            log::error!("  Relay onion (B):    {:02x?}...", &hop.onion_key[..8]);
-            
+            log::error!("AUTH VERIFICATION FAILED!");
             return Err(CircuitError::HandshakeFailed("Authentication verification failed".to_string()));
         }
 
